@@ -1,70 +1,110 @@
 """
-Telegram Ovoz Bot
-1) Matn -> Ovoz (TTS: fish-audio/s2.1-pro-free via OpenRouter)
-2) Ovoz -> Matn (STT: lokal Whisper / faster-whisper)
-Thinking: Llama 3.3 70B (OpenRouter)
+Telegram AI Ovoz Bot — AI-first oqim (to'liq qayta yozilgan)
+
+OQIM:
+  /start  -> AI salomlashuv -> AI suhbat rejimi (ai_chat)
+  Foydalanuvchi istalgan matn YOKI ovozli xabar yuboradi:
+    1. Gemini niyatni (intent) aniqlaydi: tts | grandpa | script | chat
+    2. tts      -> matnni ovozga aylantiradi
+    3. voice    -> Gemini STT orqali matnga o'girib, uni xuddi shu oqimga beradi
+    4. grandpa  -> TTS + FFmpeg 'Grandpa' effekti
+    5. script   -> Gemini qahramonlarni ajratadi -> har biriga alohida ovoz
+    6. aks holda -> o'zbekcha suhbat (tarix bilan)
+
+OVOZ SIFATI:
+  * gTTS — asosiy TTS (matn tili gTTS da qo'llab-quvvatlansa: en, ru, tr, ...).
+    Eslatma: gTTS 2.5.x 'uz' (o'zbek) tilini QO'LLAB-QUVVATLAMAYDI
+    (Google Translate endpointi ham 'Unsupported language uz' qaytaradi),
+    shuning uchun o'zbekcha matn uchun bot avtomatik ravishda Fish Audio
+    (o'zbek ovozlari bilan) ga o'tadi. Boshqa tillar uchun gTTS birinchi.
+  * Fish Audio (OpenRouter) — o'zbekcha va barcha boshqa tillar uchun,
+    shuningdek turli qahramon ovozlari uchun.
+
+BARCHA KALITLAR FAQAT .env FAYLDAN OLINADI.
 """
 
 import os
+import re
+import json
+import io
+import uuid
 import asyncio
 import logging
-import subprocess
-import tempfile
-import uuid
+import base64
 from pathlib import Path
+
 from dotenv import load_dotenv
 import imageio_ffmpeg
+import aiohttp
+
+try:
+    from gtts import gTTS
+
+    try:
+        from gtts.lang import tts_langs as _tts_langs
+        GTTS_LANGS = set(_tts_langs().keys())
+    except Exception:  # pragma: no cover
+        GTTS_LANGS = {"en", "ru", "tr", "de", "fr", "es", "it", "pt", "ja", "ko", "zh", "ar", "hi", "id", "uk"}
+    GTTS_AVAILABLE = True
+except ImportError:  # gTTS o'rnatilmagan bo'lsa — bot Fish Audio bilan ishlaveradi
+    gTTS = None
+    GTTS_LANGS = set()
+    GTTS_AVAILABLE = False
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    BufferedInputFile,
-)
-from aiogram.enums import ParseMode
+from aiogram.types import Message, BufferedInputFile
+from aiogram.enums import ParseMode, ChatAction
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-import aiohttp
 
 load_dotenv()
 
+# =============================================
+# KALITLAR (faqat .env dan!)
+# =============================================
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_THINKING_KEY = os.getenv("OPENROUTER_THINKING_KEY")
-GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")
+GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")  # Gemini (Google AI Studio)
 
-# --- Konfiguratsiya ---
+# --- Fish Audio TTS (OpenRouter) ---
 TTS_API_URL = "https://openrouter.ai/api/v1/audio/speech"
 TTS_MODEL = "fish-audio/s2.1-pro-free:free"
+
+# --- Thinking model: matnni ovozli nutqqa tayyorlash ---
 THINKING_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 THINKING_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 
-# --- Gemini AI (Google AI Studio) ---
+# --- Gemini (Google AI Studio) ---
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_MODEL = "gemini-3.5-flash-lite"  # eng barqaror bepul model
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
-# --- STT: Gemini orqali (lokal Whisper kerak emas) ---
-MAX_VOICE_SECONDS = 300  # 5 daqiqa chek
+# --- Cheklovlar ---
+MAX_VOICE_SECONDS = 300     # 5 daqiqa
+TG_MSG_LIMIT = 4000         # Telegram xabar chegarasi (4096) dan xavfsiz
+MAX_SCRIPT_CHARS = 1200     # bitta qahramon audio bo'lakchasi
+MAX_SCRIPT_CHARACTERS = 10  # senariyda ishlanadigan qahramonlar soni
+
+# --- Logger ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Foydalanuvchi ma'lumotlari (in-memory) ---
+user_data: dict[int, dict] = {}
+
+# =============================================
+# FSM — juda oddiy: asosiy AI suhbat rejimi
+# =============================================
 
 
-# --- FSM holatlar ---
 class Flow(StatesGroup):
-    choosing_mode = State()       # Matn->Ovoz yoki Ovoz->Matn
-    waiting_tts_text = State()    # TTS: matn kutish
-    waiting_grandpa_text = State() # Grandpa effekti: matn kutish
-    waiting_stt = State()         # STT: ovoz xabari kutish
-    waiting_script = State()      # Senariy tahlili: matn kutish
-    ai_chat = State()             # AI Yordamchi: suhbat
+    ai_chat = State()  # AI suhbat rejimi (asosiy holat)
 
 
 # =============================================
-# OVOZLAR KATALOGI
+# OVOZLAR KATALOGI (qahramonlar va ovoz so'rovlari uchun)
 # =============================================
 
 UZBEK_VOICES = {
@@ -91,93 +131,125 @@ CHILD_VOICES = {
     "🧒 Yosh bola (Playful)": "c0d6e010f2bb4198b98b78fb796e1b36",
 }
 
-# --- Trend ovozlari (Instagram/TikTok grandpa effekti) ---
 TREND_VOICES = {
     "👴 Grandpa Spencer (Trend)": "245aac5cae7640d88a0e81da89c1e0f3",
     "👴 Grandpa (Hikoyachi)": "b0f79e4bac084142a2ca8266bd959ae5",
     "👴 Grandpa (Faktlar, PSA)": "697a707402bf47e9940b95a5f85fbe94",
 }
 
-ALL_VOICES = {}
-ALL_VOICES.update(UZBEK_VOICES)
-ALL_VOICES.update(FEMALE_VOICES)
-ALL_VOICES.update(MALE_VOICES)
-ALL_VOICES.update(CHILD_VOICES)
-ALL_VOICES.update(TREND_VOICES)
-
-VOICE_CATEGORIES = {
-    "🇺🇿 O'zbek ovozlari": UZBEK_VOICES,
-    "👴 Trend ovozlari": TREND_VOICES,
-    "👩 Ayol ovozlari": FEMALE_VOICES,
-    "🧔 Erkak ovozlari": MALE_VOICES,
-    "🧒 Bola ovozlari": CHILD_VOICES,
+GENDER_POOLS = {
+    "male": MALE_VOICES,
+    "female": FEMALE_VOICES,
+    "child": CHILD_VOICES,
 }
 
-# --- Logger ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+DEFAULT_VOICE = UZBEK_VOICES["🧔 Erkak (Rasmiy)"]  # Fish Audio fallback ovozi
 
-# --- Foydalanuvchi ma'lumotlari ---
-user_data = {}
-
-# --- Standart ovoz: o'zbekcha ---
-DEFAULT_VOICE = UZBEK_VOICES["🧔 Erkak (Rasmiy)"]
-
-# =============================================
-# KEYBOARDLAR
-# =============================================
-
-def mode_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="1️⃣ Matn → Ovoz")],
-            [KeyboardButton(text="2️⃣ Ovoz → Matn")],
-            [KeyboardButton(text="👴 Grandpa effekti")],
-            [KeyboardButton(text="🤖 AI Yordamchi")],
-            [KeyboardButton(text="📜 Senariy tahlili")],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Tanlang...",
-    )
+GENDER_LABELS = {"male": "erkak", "female": "ayol", "child": "bola"}
 
 
-def voice_category_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-    for cat_name in VOICE_CATEGORIES:
-        buttons.append([InlineKeyboardButton(
-            text=cat_name,
-            callback_data=f"cat:{cat_name}"
-        )])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def voice_for_gender(gender: str, index: int = 0) -> tuple[str, str]:
+    """Qahramon jinsiga qarab ovoz tanlaydi (takrorlanmaslik uchun index)."""
+    pool = list(GENDER_POOLS.get(gender, UZBEK_VOICES).items())
+    name, voice_id = pool[index % len(pool)]
+    return voice_id, name
 
 
-def voice_list_keyboard(category: str) -> InlineKeyboardMarkup:
-    voices = VOICE_CATEGORIES.get(category, {})
-    buttons = []
-    for name, voice_id in voices.items():
-        buttons.append([InlineKeyboardButton(
-            text=name,
-            callback_data=f"vsel:{voice_id}"
-        )])
-    buttons.append([InlineKeyboardButton(
-        text="🔙 Orqaga",
-        callback_data="back_to_cats"
-    )])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def restart_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔄 Boshidan boshlash")]],
-        resize_keyboard=True,
-    )
+def voice_for_hint(hint: str) -> str:
+    """Foydalanuvchi ovoz so'rovi ('male', 'female', ...) -> Fish Audio voice_id."""
+    h = (hint or "default").strip().lower()
+    if h in ("male", "erkak"):
+        return list(MALE_VOICES.values())[0]
+    if h in ("female", "ayol", "qiz"):
+        return list(FEMALE_VOICES.values())[0]
+    if h in ("child", "bola", "bolacha"):
+        return list(CHILD_VOICES.values())[0]
+    if h in ("grandpa", "keksa", "bobo"):
+        return list(TREND_VOICES.values())[0]
+    return DEFAULT_VOICE
 
 
 # =============================================
-# TTS FUNKSIYASI
+# YORDAMCHI FUNKSIYALAR
 # =============================================
 
-async def text_to_speech(text: str, voice_id: str | None = None) -> bytes | None:
+
+def clip(text: str, limit: int = TG_MSG_LIMIT) -> str:
+    """Telegram xabarlar uchun xavfsiz uzunlik."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def clean_ai_text(text: str) -> str:
+    """AI matnidan keraksiz markdown belgilarini tozalaydi
+    (Telegram oddiy matnda **qalin**, `kod` ni literal ko'rsatadi)."""
+    if not text:
+        return ""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = text.replace("`", "")
+    return text.strip()
+
+
+async def safe_edit(msg: Message | None, text: str) -> None:
+    """Xabar tahrirlashda xato qaytarmasligi uchun (message is not modified va h.k.)."""
+    if msg is None:
+        return
+    try:
+        await msg.edit_text(text)
+    except Exception as e:
+        logger.debug(f"edit_text xatosi: {e}")
+
+
+async def kill(msg: Message | None) -> None:
+    if msg is None:
+        return
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.debug(f"delete xatosi: {e}")
+
+
+async def typing(message: Message) -> None:
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        pass
+
+
+# =============================================
+# TTS: gTTS (asosiy) + Fish Audio (ikkinchi)
+# =============================================
+
+
+async def gtts_speak(text: str, lang: str = "en") -> bytes | None:
+    """gTTS — sinxron kutubxona, shuning uchun asyncio.to_thread ichida."""
+    lang = (lang or "en").strip()
+    if not GTTS_AVAILABLE or lang not in GTTS_LANGS:
+        # gTTS bu tilni qo'llab-quvvatlamaydi (masalan, 'uz') yoki o'rnatilmagan
+        return None
+
+    def _synth() -> bytes:
+        buf = io.BytesIO()
+        gTTS(text=text, lang=lang, slow=False).write_to_fp(buf)
+        return buf.getvalue()
+
+    try:
+        data = await asyncio.to_thread(_synth)
+        return data if data and len(data) > 100 else None
+    except Exception as e:
+        logger.error(f"gTTS xatosi ({lang}): {e}")
+        return None
+
+
+async def fish_audio_tts(text: str, voice_id: str | None = None) -> bytes | None:
+    """Fish Audio TTS (OpenRouter orqali)."""
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY topilmadi — Fish Audio TTS ishlamaydi")
+        return None
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -200,27 +272,71 @@ async def text_to_speech(text: str, voice_id: str | None = None) -> bytes | None
         }
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            TTS_API_URL, headers=headers, json=payload,
-            timeout=aiohttp.ClientTimeout(total=180),
-        ) as resp:
-            if resp.status != 200:
-                error_text = await resp.text()
-                logger.error(f"TTS API xatosi {resp.status}: {error_text}")
-                # Provider options xato bersa, oddiy so'rov
-                if "provider" in error_text or "voice" in error_text:
-                    payload.pop("provider", None)
-                    payload.pop("voice", None)
-                    async with session.post(
-                        TTS_API_URL, headers=headers, json=payload,
-                        timeout=aiohttp.ClientTimeout(total=180),
-                    ) as retry_resp:
-                        if retry_resp.status != 200:
-                            return None
-                        return await retry_resp.read()
-                return None
-            return await resp.read()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                TTS_API_URL, headers=headers, json=payload,
+                timeout=aiohttp.ClientTimeout(total=180),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"TTS API xatosi {resp.status}: {error_text[:300]}")
+                    # Provider options xato bersa — oddiy so'rov bilan qayta urinish
+                    if "provider" in error_text or "voice" in error_text:
+                        payload.pop("provider", None)
+                        payload.pop("voice", None)
+                        async with session.post(
+                            TTS_API_URL, headers=headers, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=180),
+                        ) as retry_resp:
+                            if retry_resp.status != 200:
+                                return None
+                            data = await retry_resp.read()
+                            return data if data and len(data) > 100 else None
+                    return None
+                data = await resp.read()
+                return data if data and len(data) > 100 else None
+    except Exception as e:
+        logger.error(f"Fish Audio TTS xatosi: {e}")
+        return None
+
+
+async def synthesize_speech(
+    text: str,
+    lang: str = "uz",
+    voice_id: str | None = None,
+    prefer_fish: bool = False,
+) -> tuple[bytes | None, str]:
+    """
+    Matnni ovozga aylantiradi.
+    - gTTS birinchi (matn tili gTTS da qo'llab-quvvatlansa: en, ru, tr, ...)
+    - Fish Audio ikkinchi (o'zbekcha va aniq ovoz so'ralsa birinchi)
+    Qaytadi: (audio_bytes | None, qaysi dvigatel ishlatildi)
+    """
+    text = (text or "").strip()
+    if not text:
+        return None, ""
+
+    gtts_ok = lang in GTTS_LANGS
+    fish_ok = bool(OPENROUTER_API_KEY)
+
+    if prefer_fish:
+        order = (["fish"] if fish_ok else []) + (["gtts"] if gtts_ok else [])
+    else:
+        order = (["gtts"] if gtts_ok else []) + (["fish"] if fish_ok else [])
+
+    for engine in order:
+        if engine == "gtts":
+            audio = await gtts_speak(text, lang)
+            label = "gTTS"
+        else:
+            audio = await fish_audio_tts(text, voice_id)
+            label = "Fish Audio"
+        if audio:
+            return audio, label
+
+    logger.error(f"Ovoz yaratib bo'lmadi (lang={lang}, engine={order})")
+    return None, ""
 
 
 # =============================================
@@ -231,41 +347,32 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 TMP_DIR = Path(__file__).parent / "tmp"
 TMP_DIR.mkdir(exist_ok=True)
 
-# Grandpa effekti sozlamalari (tuning uchun o'zgartirish mumkin)
 GRANDPA_SETTINGS = {
-    "pitch": 0.82,      # pastroq ovoz (0.75-0.90)
-    "tempo": 0.97,      # biroz sekinroq (0.90-1.0)
-    "low_boost_db": 3,  # ko'krak rezonansi
-    "high_cut_db": -3,  # yuqori chastotani kesish (keksa ovoz)
+    "pitch": 0.82,        # pastroq ovoz (0.75-0.90)
+    "tempo": 0.97,        # biroz sekinroq (0.90-1.0)
+    "low_boost_db": 3,    # ko'krak rezonansi
+    "high_cut_db": -3,    # yuqori chastotani kesish (keksa ovoz)
     "clip_threshold": 0.8,  # asoftclip chegarasi
-    "denoise_strength": 10, # afftdn NR darajasi
-    "loudnorm_I": -16,  # loudnorm maqsadli loudness
+    "denoise_strength": 10,  # afftdn NR darajasi
+    "loudnorm_I": -16,    # loudnorm maqsadli loudness
 }
 
 
 async def apply_grandpa_effect(audio_bytes: bytes) -> bytes | None:
     """
-    TTS audio fayliga 'Grandpa' (keksa odam) effektini qo'llaydi.
-    FFmpeg orqali: pitch/formant pastga, EQ bilan yumshoqlik,
-    shovqin pasaytirish, loudness normallashtirish.
+    Audio fayliga 'Grandpa' (keksa odam) effektini qo'llaydi.
+    FFmpeg: rubberband (pitch/formant) + EQ + asoftclip + afftdn + loudnorm.
     """
     s = GRANDPA_SETTINGS
     filter_str = (
-        # 1) Pitch va formantni pastga (rubberband, formant=shifted default)
         f"rubberband=pitch={s['pitch']}:tempo={s['tempo']},"
-        # 2) Ko'krak rezonansi (past chastota kuchaytirish)
         f"equalizer=f=180:t=q:w=1.5:g={s['low_boost_db']},"
-        # 3) Yuqori chastotani kesish (keksa ovoz uchun)
         f"equalizer=f=3500:t=q:w=2:g={s['high_cut_db']},"
-        # 4) Engil issiqlik (asoftclip tanh)
         f"asoftclip=type=tanh:threshold={s['clip_threshold']},"
-        # 5) Shovqin pasaytirish
         f"afftdn=nr={s['denoise_strength']}:nf=-30,"
-        # 6) Loudness normallashtirish
         f"loudnorm=I={s['loudnorm_I']}:TP=-1.5:LRA=11"
     )
 
-    # Unikallik: uuid4 bilan bir vaqtda ko'p foydalanuvchi arashmaydi
     uid = uuid.uuid4().hex[:12]
     in_path = TMP_DIR / f"gp_in_{uid}.mp3"
     out_path = TMP_DIR / f"gp_out_{uid}.mp3"
@@ -286,7 +393,7 @@ async def apply_grandpa_effect(audio_bytes: bytes) -> bytes | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
             logger.error(f"Grandpa FFmpeg xatosi: {stderr.decode(errors='replace')[:300]}")
@@ -302,7 +409,6 @@ async def apply_grandpa_effect(audio_bytes: bytes) -> bytes | None:
         logger.error(f"Grandpa effekti xatosi: {e}")
         return None
     finally:
-        # Xavfsiz tozalash
         for p in (in_path, out_path):
             try:
                 if p.exists():
@@ -312,23 +418,22 @@ async def apply_grandpa_effect(audio_bytes: bytes) -> bytes | None:
 
 
 # =============================================
-# STT: GEMINI (lokal Whisper o'chirilgan)
+# THINKING MODEL — matnni ovozli nutqqa tayyorlash
 # =============================================
 
-
-# =============================================
-# THINKING MODEL
-# =============================================
 
 async def improve_prompt(text: str, mode: str = "tts") -> str:
-    """Thinking model matnni ovozli nutqqa tayyorlaydi (o'zbekcha ustuvor)."""
+    """Thinking model matnni ovozli nutqqa tayyorlaydi (raqamlar -> so'zlar, imlo va h.k.)."""
+    if not OPENROUTER_THINKING_KEY:
+        return text
+
     if mode == "stt":
         system_msg = (
             "Siz ovozdan matnga aylantirilgan matnni tozalaysiz.\n"
             "Vazifangiz:\n"
             "1. Punktuatsiyani qo'shing (nuqta, vergul, savol belgisi).\n"
             "2. O'zbekcha matn bo'lsa, imlosini tuzating: o', g', so'ngra, "
-            "nima uchun, ndefa, xuddi, albatta.\n"
+            "nima uchun, xuddi, albatta.\n"
             "3. Transkripsiya xato so'zlarini kontekstdan kelib chiqib tuzating.\n"
             "4. Ma'noni hech qanday o'zgartirmang, qo'shimcha so'z qo'shmang.\n"
             "5. Matn boshqa tilda bo'lsa, o'sha tilda tozalang.\n\n"
@@ -341,7 +446,7 @@ async def improve_prompt(text: str, mode: str = "tts") -> str:
             "1. Punktuatsiyani to'g'rilang — nutqda pauzalar shu belgilarga "
             "bog'lanadi (nuqta, vergul, savol/tanqis belgisi).\n"
             "2. O'zbekcha matn bo'lsa, imlosini tekshiring: o', g', so'ngra, "
-            "nima uchun, ndefa, xuddi, albatta.\n"
+            "nima uchun, xuddi, albatta.\n"
             "3. Raqamlarni ovozda o'qiladigan so'zlarga aylantiring, chunki "
             "model raqamlarni noto'g'ri o'qiydi:\n"
             "   - 2025 -> 'ikki ming yigirma besh'\n"
@@ -363,10 +468,10 @@ async def improve_prompt(text: str, mode: str = "tts") -> str:
         "model": THINKING_MODEL,
         "messages": [
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": text},
+            {"role": "user", "content": text[:6000]},
         ],
         "max_tokens": 1000,
-        "reasoning": {"enabled": False},  # reasoning model — tezroq va ishonchliroq javob
+        "reasoning": {"enabled": False},
     }
 
     try:
@@ -380,33 +485,37 @@ async def improve_prompt(text: str, mode: str = "tts") -> str:
                 data = await resp.json()
                 content = data["choices"][0]["message"].get("content")
                 if not content:
-                    logger.warning("Thinking model bo'sh javob qaytardi")
                     return text
-                # Thinking/markdown belgilarini tozalash (ovozga o'qilmasligi uchun)
                 for junk in ("```", "`", "**", "__", "#"):
                     content = content.replace(junk, "")
                 content = content.strip()
                 return content if content else text
     except Exception as e:
-        logger.error(f"Thinking xatosi: {e}")
+        logger.error(f"improve_prompt xatosi: {e}")
         return text
 
 
 # =============================================
-# GEMINI AI (Google AI Studio)
+# GEMINI AI — umumiy so'rov + chat / JSON / STT
 # =============================================
 
-async def gemini_chat(user_message: str, system_prompt: str | None = None) -> str | None:
-    """Gemini API orqali matn javobini qaytaradi."""
+
+async def _gemini_call(contents: list, system_prompt: str | None = None,
+                       temperature: float = 0.6) -> str | None:
+    """Gemini generateContent ga so'rov yuboradi, matn javobini qaytaradi."""
     if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY topilmadi")
+        logger.warning("GEMINI_API_KEY (MIYYA_API_KEY) topilmadi")
         return None
 
     url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-    contents = [{"parts": [{"text": user_message}]}]
-    payload = {"contents": contents}
-
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": 8192,
+        },
+    }
     if system_prompt:
         payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
@@ -414,107 +523,549 @@ async def gemini_chat(user_message: str, system_prompt: str | None = None) -> st
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url, json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=90),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
-                    logger.error(f"Gemini API xatosi {resp.status}: {error_text[:200]}")
+                    logger.error(f"Gemini API xatosi {resp.status}: {error_text[:300]}")
                     return None
                 data = await resp.json()
                 candidates = data.get("candidates", [])
                 if not candidates:
+                    logger.warning("Gemini: candidates bo'sh")
                     return None
                 parts = candidates[0].get("content", {}).get("parts", [])
-                for p in parts:
-                    if "text" in p:
-                        return p["text"].strip()
-                return None
+                chunks = [p["text"] for p in parts if "text" in p]
+                text = "".join(chunks).strip()
+                return text or None
     except Exception as e:
-        logger.error(f"Gemini chat xatosi: {e}")
+        logger.error(f"Gemini so'rov xatosi: {e}")
         return None
 
 
-async def gemini_analyze_script(script_text: str) -> str | None:
-    """Senariyni tahlil qiladi — tuzilish, qahramonlar, sahnalar."""
-    system_prompt = (
-        "Sen professional senariy tahlilchisisiz.\n"
-        "Foydalanuvchi senariy yuboradi. Sen quyidagilarni qil:\n"
-        "1. Senariy tuzilishini ajrat (boshlash, rivojlanish, yakun).\n"
-        "2. Qahramonlarni sanab chiq (ism, xarakter).\n"
-        "3. Asosiy g'oyani bir jumla bilan ayting.\n"
-        "4. Ovoz yozish uchun tavsiyalar bering (ohang, temp).\n\n"
-        "Juda qisqa va aniq javob bering (500 belgidan kam)."
-    )
-    return await gemini_chat(script_text, system_prompt)
+def _contents_with_history(user_message: str, history: list | None) -> list:
+    """Foydalanuvchi suhbat tarixini Gemini contents ko'rinishiga o'giradi."""
+    contents = []
+    for h in (history or [])[-10:]:
+        role = h.get("role", "user")
+        if role not in ("user", "model"):
+            role = "user"
+        txt = (h.get("text") or "").strip()
+        if txt:
+            contents.append({"role": role, "parts": [{"text": txt}]})
+    contents.append({"role": "user", "parts": [{"text": user_message}]})
+    return contents
 
 
-async def gemini_bot_help(user_message: str) -> str | None:
-    """Bot haqida savollarga javob beradi."""
-    system_prompt = (
-        "Sen Telegram ovoz boti yordamchisisiz.\n"
-        "Bot imkoniyatlari:\n"
-        "1. Matn → Ovoz: matnni ovozga aylantiradi (Fish Audio TTS)\n"
-        "2. Ovoz → Matn: ovozli xabarni matnga aylantiradi (Gemini STT)\n"
-        "3. Grandpa effekti: matnni keksa odam ovozida aylantiradi\n"
-        "4. Turli ovozlar: o'zbek, ayol, erkak, bola, trend ovozlari\n"
-        "5. AI Yordamchi: sizga savollarga javob beradi\n\n"
-        "O'zbek tilida qisqa va tushunarli javob bering.\n"
-        "Agar foydalanuvchi ovoz yaratish haqida so'rasa, /start buyrug'ini maslahat bering."
+async def gemini_chat(user_message: str, system_prompt: str | None = None,
+                      history: list | None = None) -> str | None:
+    """Gemini orqali suhbat javobi."""
+    return await _gemini_call(
+        _contents_with_history(user_message, history),
+        system_prompt,
+        temperature=0.8,
     )
-    return await gemini_chat(user_message, system_prompt)
+
+
+def _parse_json_block(text: str) -> dict | None:
+    """Gemini javobidan JSON obyektini ajratib oladi (markdown kod bloklarini ham)."""
+    if not text:
+        return None
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    candidate = t[start:end + 1]
+
+    for attempt in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+        try:
+            obj = json.loads(attempt)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+async def gemini_json(user_message: str, system_prompt: str,
+                      history: list | None = None,
+                      temperature: float = 0.2) -> dict | None:
+    """Gemini dan strukturali JSON oladi."""
+    text = await _gemini_call(
+        _contents_with_history(user_message, history),
+        system_prompt,
+        temperature=temperature,
+    )
+    return _parse_json_block(text)
 
 
 async def gemini_stt(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
     """Ovoz faylini Gemini orqali matnga aylantiradi (STT)."""
-    import base64
-
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY topilmadi")
-        return None
-
-    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    contents = [{
+        "parts": [
+            {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+            {"text": (
+                "Bu ovozli xabar (Telegram voice message). "
+                "Undagi so'zlarni aniq transkripsiya qiling.\n"
+                "Qoidalar:\n"
+                "- Agar o'zbekcha bo'lsa, o'zbek tilida yozing (o', g', so'ngra)\n"
+                "- Agar boshqa tilda bo'lsa, o'sha tilda yozing\n"
+                "- Faqat transkripsiya matnini qaytaring\n"
+                "- Boshqa hech narsa yozmang (izoh, tushuntirish kerak emas)"
+            )},
+        ]
+    }]
+    return await _gemini_call(contents, temperature=0.1)
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
-                {"text": (
-                    "Bu ovozli xabar (Telegram voice message). "
-                    "Undagi so'zlarni aniq transkripsiya qiling.\n"
-                    "Qoidalar:\n"
-                    "- Agar o'zbekcha bo'lsa, o'zbek tilida yozing (o', g', so'm)\n"
-                    "- Agar boshqa tilda bo'lsa, o'sha tilda yozing\n"
-                    "- Faqat transkripsiya matnini qaytaring\n"
-                    "- Boshqa hech narsa yozmang (izoh, tushuntirish kerak emas)"
-                )}
-            ]
-        }]
+
+# =============================================
+# NIYAT (INTENT) ANIQLASH — Gemini + kalit so'z fallback
+# =============================================
+
+VALID_INTENTS = {"chat", "tts", "grandpa", "script"}
+
+INTENT_SYSTEM = """Sen Telegram AI ovoz botining miyasisan. Foydalanuvchi xabarini tahlil qilib, NATIJANI FAQAT JSON ko'rinishida qaytarasiz (boshqa matn, tarmoqcha belgi yoki izoh YO'Q).
+
+Intent turlari:
+1. "tts" — foydalanuvchi matnni ovozga aylantirmoqchi (masalan: 'ovozga chiqar', 'o'qib ber', 'tts qil', 'speak').
+2. "grandpa" — keksa odam / bobo ovozi effekti so'ralmoqda.
+3. "script" — uzun senariy, dialog, pyescha, dars skripti yoki audiodrama (odatda 2+ qahramon, 'Ism: matn' ko'rinishidagi replikalar).
+4. "chat" — oddiy suhbat, savol, tarjima, hisob-kitob, yordam va boshqalar.
+
+JSON shakli:
+{
+  "intent": "chat|tts|grandpa|script",
+  "text": "ovoz uchun toza matn (faqat tts/grandpa uchun: tarmoqcha, #, emoji, rejissyor yo'riqnomalarini olib tashlang, raqamlarni so'zlarga aylantiring)",
+  "lang": "matn tili ikki harfda: uz, ru, en, kk, ky, tr, de, ...",
+  "voice": "default|male|female|child|grandpa — foydalanuvchi aniq ovoz talab qilmasa 'default'",
+  "reply": "faqat chat intenti uchun: iliq, foydali javob (o'zbekcha, 1000 belgidan qisqa, emoji bo'lishi mumkin)"
+}
+
+Muhim qoidalar:
+- Javob FAQAT JSON bo'lishi kerak.
+- 'script' intentida 'text' maydoniga senariyni takrorlash shart emas (bo'sh qoldiring).
+- Matn boshqa tilda bo'lsa, 'lang' shu tilni ko'rsating.
+- Foydalanuvchi o'zbekcha yozsa, 'reply'ni o'zbekcha yozing."""
+
+GRANDPA_KEYWORDS = ("grandpa", "keksa", "bobojon", "bobo ovoz", "keksa odam", "bobokhal", "👴")
+TTS_KEYWORDS = (
+    "ovozga aylantir", "ovozga chiqar", "ovozga ot", "o'qib ber", "oqib ber",
+    "ovozli qil", "gapirtir", "ovoz ber", "tts", "speak", "audio qil", "ovozga utqaz",
+)
+CHAT_KEYWORDS_HELP = (
+    "nima qila", "imkoniyat", "yordam", "help", "qanday ishla", "bot nima", "команда",
+)
+
+
+def keyword_intent(raw: str) -> dict:
+    """Gemini ishlamaydigan bo'lsa — oddiy kalit so'zlar bilan niyat aniqlash."""
+    text = (raw or "").strip()
+    low = text.lower()
+
+    # 1) Senariy: uzoq matn + 'Ism: matn' ko'rinishidagi replikalar
+    dialogue_lines = [
+        ln for ln in text.splitlines()
+        if re.match(r"^\s*[^:\n]{1,40}:\s*\S", ln)
+    ]
+    if len(text) >= 200 and len(dialogue_lines) >= 3:
+        return {"intent": "script", "text": "", "lang": "uz", "voice": "default", "reply": ""}
+
+    # 2) Grandpa effekti
+    if any(k in low for k in GRANDPA_KEYWORDS):
+        return {"intent": "grandpa", "text": text, "lang": "uz", "voice": "default", "reply": ""}
+
+    # 3) Matn -> ovoz
+    if any(k in low for k in TTS_KEYWORDS):
+        return {"intent": "tts", "text": text, "lang": "uz", "voice": "default", "reply": ""}
+
+    # 4) Oddiy suhbat
+    return {"intent": "chat", "text": text, "lang": "uz", "voice": "default", "reply": ""}
+
+
+def normalize_lang(lang) -> str:
+    if not isinstance(lang, str) or len(lang.strip()) < 2:
+        return "uz"
+    return lang.strip()[:2].lower()
+
+
+def normalize_intent(obj: dict | None, raw: str) -> dict:
+    """Gemini JSONini tekshiradi/mukammallantiradi; yaroqsiz bo'lsa fallback."""
+    if not isinstance(obj, dict):
+        return keyword_intent(raw)
+
+    kind = str(obj.get("intent", "")).strip().lower()
+    if kind not in VALID_INTENTS:
+        logger.warning(f"Noma'lum intent: {kind!r} — fallback ishlatiladi")
+        return keyword_intent(raw)
+
+    result = {
+        "intent": kind,
+        "text": str(obj.get("text") or "").strip(),
+        "lang": normalize_lang(obj.get("lang")),
+        "voice": str(obj.get("voice") or "default").strip().lower(),
+        "reply": str(obj.get("reply") or "").strip(),
     }
 
+    # tts/grandpa uchun matn bo'sh bo'lsa — xududiy matndan foydalanamiz
+    if kind in ("tts", "grandpa") and not result["text"]:
+        result["text"] = raw.strip()
+
+    return result
+
+
+async def detect_intent(text: str, history: list | None = None) -> dict:
+    """Gemini orqali niyat aniqlaydi; Gemini yiqilsa — kalit so'z fallback."""
+    raw = await gemini_json(text, INTENT_SYSTEM, history=history, temperature=0.2)
+    intent = normalize_intent(raw, text)
+    logger.info(f"Intent: {intent['intent']} (lang={intent['lang']}, voice={intent['voice']})")
+    return intent
+
+
+# =============================================
+# SENARIY TAHLILI — qahramonlarni ajratish
+# =============================================
+
+SCRIPT_SYSTEM = (
+    "Sen professional senariy tahlilchisisiz. Sizga senariy (dialog, pyescha, "
+    "dars skripti, audiodrama) beriladi. Uni OVOZ YOZISH uchun quyidagi JSON "
+    "ko'rinishida qaytaring (faqat JSON, boshqa matn yo'q):\n\n"
+    "{\n"
+    '  "lang": "senariy tili, ikki harf (masalan uz)",\n'
+    '  "characters": [\n'
+    "    {\n"
+    '      "name": "Qahramon nomi",\n'
+    '      "gender": "male",\n'
+    '      "lines": ["Birinchi replikasi", "Ikkinchi replikasi"]\n'
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    "Qoidalar:\n"
+    "1. Faqat qahramonlarining SO'ZLARINI 'lines' ichiga joylang; rejissyor "
+    "yo'riqnomalari, sahna nomlari, tavsiflar kerak emas.\n"
+    "2. Har bir qahramon alohida obyekt bo'lsin; uning replikalari ketma-ket "
+    "tartibda joylansin.\n"
+    "3. 'gender': erkak/o'g'il/ota -> male, ayol/qiz/onasi -> female, bola/"
+    "bolalar/chaqaloq -> child.\n"
+    "4. 12 tadan ko'p qahramon bo'lmasin.\n"
+    "5. Matn tilini o'zgartirmang (tarjima qilmang).\n"
+    "6. Agar qahramon nomi bo'lmasa: 'Qahramon 1', 'Qahramon 2' deb nomlang."
+)
+
+
+def normalize_script(obj: dict | None) -> list[dict]:
+    """Gemini JSONini qahramonlar ro'yxatiga aylantiradi."""
+    if not isinstance(obj, dict):
+        return []
+    chars = obj.get("characters")
+    if not isinstance(chars, list):
+        return []
+
+    result = []
+    for c in chars[:MAX_SCRIPT_CHARACTERS]:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "Qahramon").strip()[:40] or "Qahramon"
+        gender = str(c.get("gender") or "male").strip().lower()
+        if gender not in GENDER_POOLS:
+            if gender in ("erkak", "m", "man", "o'g'il", "ota"):
+                gender = "male"
+            elif gender in ("ayol", "f", "qiz", "onasi", "ayol kishi"):
+                gender = "female"
+            elif gender in ("bola", "bolalar", "chaqaloq", "bolacha"):
+                gender = "child"
+            else:
+                gender = "male"
+        lines = c.get("lines") or []
+        if isinstance(lines, str):
+            lines = [lines]
+        lines = [str(l).strip() for l in lines if str(l).strip()]
+        if lines:
+            result.append({"name": name, "gender": gender, "lines": lines})
+
+    return result
+
+
+async def parse_script(text: str) -> tuple[list[dict], str]:
+    """Senariyni Gemini bilan tahlil qilib, qahramonlar ro'yxatini qaytaradi."""
+    raw = await gemini_json(text, SCRIPT_SYSTEM, temperature=0.2)
+    characters = normalize_script(raw)
+    lang = normalize_lang(raw.get("lang")) if isinstance(raw, dict) else "uz"
+    return characters, lang
+
+
+def chunk_lines(lines: list[str], max_chars: int = MAX_SCRIPT_CHARS) -> list[str]:
+    """Qahramon replikalarini ovoz uchun qulay bo'lakchalarga bo'ladi."""
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > max_chars:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current} {line}".strip() if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# =============================================
+# SUHBAT TARIXI
+# =============================================
+
+
+def get_history(uid: int) -> list[dict]:
+    return user_data.setdefault(uid, {}).setdefault("history", [])
+
+
+def append_history(uid: int, user_text: str, bot_text: str) -> None:
+    history = get_history(uid)
+    history.append({"role": "user", "text": user_text[:2000]})
+    history.append({"role": "model", "text": bot_text[:2000]})
+    del history[:-12]  # oxirgi 12 xabarni saqlaymiz (4 juft)
+
+
+# =============================================
+# PROMPTLAR (salomlashuv, suhbat, fallback)
+# =============================================
+
+GREETING_SYSTEM = (
+    "Sen 'AI Ovoz Bot' — Telegram'dagi iliq, do'stona o'zbek tilidagi yordamchisan.\n"
+    "Foydalanuvchi botni yangi boshladi. Quyidagilarni qisqacha va chiroyli "
+    "emoji bilan tushuntirib, so'ng o'zingizdan xabar kutishini so'rang:\n"
+    "- Matnni ovozga aylantirish (tabiiy ovoz)\n"
+    "- Ovozli xabarni matnga aylantirish\n"
+    "- Grandpa (keksa odam) effekti\n"
+    "- Senariy bo'yicha har bir qahramon uchun alohida ovoz\n"
+    "- Oddiy suhbat va savollarga javob\n\n"
+    "Qoidalar: 350 belgidan kam, o'zbekcha, emoji bilan. Faqat matn qaytaring."
+)
+
+DEFAULT_GREETING = (
+    "Assalomu alaykum! 👋 Men <b>AI Ovoz Bot</b>man — sizning o'zbek tilidagi "
+    "ovoz yordamchingiz.\n\n"
+    "Men nima qila olaman:\n"
+    "🔊 Matnni ovozga aylantiraman\n"
+    "🎤 Ovozli xabaringizni matnga aylantiraman\n"
+    "👴 Grandpa (keksa odam) effektini qo'llayman\n"
+    "🎭 Senariy bo'yicha har bir qahramonni alohida ovozda ovozlayman\n"
+    "💬 Har qanday savolga o'zbekcha javob beraman\n\n"
+    "Shunchaki yozing yoki mikrofon tugmasini bosib ovoz yuboring — "
+    "men o'zim tushunib olaman. 😊"
+)
+
+CHAT_SYSTEM = (
+    "Sen 'AI Ovoz Bot' — Telegram'dagi foydali o'zbek tilidagi yordamchisan.\n"
+    "Imkoniyatlaring: matnni ovozga aylantirish, ovozli xabarni matnga o'girish, "
+    "Grandpa effekti, senariy bo'yicha qahramonlarga alohida ovoz, oddiy suhbat.\n"
+    "Qoidalar:\n"
+    "- Doimo o'zbek tilida javob bering (foydalanuvchi boshqa tilda yozmasa).\n"
+    "- Qisqa, iliq, do'stona va amaliy bo'ling (1000 belgidan kam).\n"
+    "- Agar foydalanuvchi ovoz yaratishni so'rasa, matnni jo'natishini ayting — "
+    "bot o'zi ovozga aylantiradi.\n"
+    "- Kutilmagan savolga ham foydali javob bering."
+)
+
+
+def fallback_chat_reply(text: str) -> str:
+    """Gemini umuman ishlamasa — oddiy kalit so'zli javoblar."""
+    low = text.lower()
+    if any(k in low for k in ("salom", "assalomu", "привет", "hello", "hi")):
+        return ("Assalomu alaykum! 👋 Men AI Ovoz Botman. Matn yozing — "
+                "ovozga aylantiraman, yoki ovoz yuboring — matnga o'giraman.")
+    if any(k in low for k in CHAT_KEYWORDS_HELP):
+        return ("Men quyidagilarni qila olaman:\n"
+                "🔊 Matn → ovoz\n"
+                "🎤 Ovoz → matn\n"
+                "👴 Grandpa effekti\n"
+                "🎭 Senariy → qahramonlar uchun alohida ovoz\n\n"
+                "Shunchaki matn yoki ovoz yuboring — men o'zim tushunaman. 😊")
+    if any(k in low for k in ("ovoz", "tts", "voice")):
+        return "Matnni yuboring — men uni ovozga aylantirib beraman. 🔊"
+    return ("Kechirasiz, AI bilan aloqa vaqtincha uzildi 😔. "
+            "Birozdan keyin qayta yozing yoki /start bosing.")
+
+
+# =============================================
+# AI OQIMI — niyat bo'yicha amallar
+# =============================================
+
+
+async def do_tts(message: Message, processing: Message, text: str, intent: dict) -> None:
+    """Matn -> ovoz."""
+    speak = (intent.get("text") or text).strip()
+    lang = intent.get("lang") or "uz"
+    hint = intent.get("voice") or "default"
+
+    if not speak:
+        await safe_edit(processing, "⚠️ Ovozga aylantirish uchun matn topilmadi.")
+        return
+    if len(speak) > 4000:
+        speak = speak[:4000]
+
+    await safe_edit(processing, "⏳ Ovoz yaratilmoqda...")
+    await typing(message)
+
+    audio, engine = await synthesize_speech(
+        speak, lang=lang, voice_id=voice_for_hint(hint),
+        prefer_fish=(hint != "default"),
+    )
+
+    if not audio:
+        await safe_edit(processing, "❌ Ovoz yaratib bo'lmadi. Birozdan so'ng qayta urinib ko'ring.")
+        return
+
+    await message.answer_voice(
+        voice=BufferedInputFile(audio, filename="voice.mp3"),
+        caption=f"🔊 {engine} • {lang.upper()} • {len(speak)} belgi",
+    )
+    await kill(processing)
+
+
+async def do_grandpa(message: Message, processing: Message, text: str, intent: dict) -> None:
+    """Matn -> ovoz -> Grandpa (keksa odam) effekti."""
+    speak = (intent.get("text") or text).strip()
+    lang = intent.get("lang") or "uz"
+    hint = intent.get("voice") or "default"
+
+    if not speak:
+        await safe_edit(processing, "⚠️ Grandpa effekti uchun matn topilmadi.")
+        return
+    if len(speak) > 3000:
+        speak = speak[:3000]
+
+    await safe_edit(processing, "⏳ Ovoz yaratilmoqda...")
+    await typing(message)
+
+    audio, _engine = await synthesize_speech(
+        speak, lang=lang, voice_id=voice_for_hint(hint),
+        prefer_fish=(hint != "default"),
+    )
+    if not audio:
+        await safe_edit(processing, "❌ Ovoz yaratib bo'lmadi. Qayta urinib ko'ring.")
+        return
+
+    await safe_edit(processing, "👴 Grandpa effekti qo'llanmoqda...")
+    processed = await apply_grandpa_effect(audio)
+    if processed is None:
+        logger.warning("Grandpa effekti ishlamadi, oddiy ovoz yuboriladi")
+        processed = audio
+
+    await message.answer_voice(
+        voice=BufferedInputFile(processed, filename="grandpa_voice.mp3"),
+        caption=f"👴 Grandpa effekti • {len(speak)} belgi",
+    )
+    await kill(processing)
+
+
+async def do_script(message: Message, processing: Message, text: str) -> None:
+    """Senariy -> qahramonlarni ajratish -> har biriga alohida ovoz."""
+    await safe_edit(processing, "📜 Senariy tahlil qilinmoqda...")
+    await typing(message)
+
+    characters, lang = await parse_script(text)
+
+    if not characters:
+        await safe_edit(
+            processing,
+            "❌ Senariy qahramonlarini topa olmadim.\n"
+            "Iltimos, senariyni 'Ism: matn' ko'rinishida jo'natib ko'ring.",
+        )
+        return
+
+    summary_lines = "\n".join(
+        f"• {c['name']} — {GENDER_LABELS.get(c['gender'], 'erkak')} "
+        f"({len(c['lines'])} ta replika)"
+        for c in characters
+    )
+    await message.answer(clip(f"🎭 {len(characters)} ta qahramon topildi:\n{summary_lines}"))
+
+    used = {"male": 0, "female": 0, "child": 0}
+    sent = 0
+
+    for ch in characters:
+        voice_id, voice_name = voice_for_gender(ch["gender"], used[ch["gender"]])
+        used[ch["gender"]] += 1
+
+        parts = chunk_lines(ch["lines"])
+        for idx, part in enumerate(parts, start=1):
+            await safe_edit(
+                processing,
+                f"⏳ {ch['name']} ovozi yaratilmoqda ({idx}/{len(parts)})...",
+            )
+            await typing(message)
+
+            # Qahramon ovozlari uchun Fish Audio (har xil ovozlar kerak),
+            # u ishlamasa — gTTS ga fallback
+            audio = await fish_audio_tts(part, voice_id)
+            if not audio:
+                audio = await gtts_speak(part, lang)
+
+            if not audio:
+                logger.error(f"{ch['name']} uchun ovoz yaratib bo'lmadi")
+                continue
+
+            caption = f"🎭 {ch['name']} • {voice_name}"
+            if len(parts) > 1:
+                caption += f" ({idx}/{len(parts)})"
+            await message.answer_voice(
+                voice=BufferedInputFile(audio, filename="voice.mp3"),
+                caption=caption,
+            )
+            sent += 1
+
+    if sent == 0:
+        await safe_edit(processing, "❌ Ovozlarni yaratib bo'lmadi. Qayta urinib ko'ring.")
+        return
+
+    await kill(processing)
+    await message.answer(f"✅ Tayyor! {sent} ta ovozli xabar yuborildi. 🎉")
+
+
+async def do_chat(message: Message, processing: Message, text: str,
+                  intent: dict, history: list) -> None:
+    """Oddiy suhbat (Gemini + tarix + fallback)."""
+    reply = (intent.get("reply") or "").strip()
+
+    if not reply:
+        await typing(message)
+        reply = (await gemini_chat(text, CHAT_SYSTEM, history=history) or "").strip()
+
+    if not reply:
+        reply = fallback_chat_reply(text)
+
+    append_history(message.from_user.id, text, reply)
+    await safe_edit(processing, clip(clean_ai_text(reply), TG_MSG_LIMIT))
+
+
+async def run_pipeline(message: Message, user_text: str, processing: Message) -> None:
+    """Asosiy AI oqimi: niyat aniqlash -> amal bajarish."""
+    text = (user_text or "").strip()
+    if not text:
+        await safe_edit(processing, "⚠️ Matn topilmadi. Iltimos, qayta yozing.")
+        return
+
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"Gemini STT xatosi {resp.status}: {error_text[:200]}")
-                    return None
-                data = await resp.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    return None
-                parts = candidates[0].get("content", {}).get("parts", [])
-                for p in parts:
-                    if "text" in p:
-                        return p["text"].strip()
-                return None
+        await typing(message)
+        history = get_history(message.from_user.id)
+        intent = await detect_intent(text, history)
+        kind = intent["intent"]
+
+        if kind == "tts":
+            await do_tts(message, processing, text, intent)
+        elif kind == "grandpa":
+            await do_grandpa(message, processing, text, intent)
+        elif kind == "script":
+            await do_script(message, processing, text)
+        else:
+            await do_chat(message, processing, text, intent, history)
+
     except Exception as e:
-        logger.error(f"Gemini STT xatosi: {e}")
-        return None
+        logger.error(f"Oqim xatosi: {e}", exc_info=True)
+        await safe_edit(processing, f"❌ Kutilmagan xatolik: {str(e)[:200]}")
 
 
 # =============================================
@@ -524,465 +1075,147 @@ async def gemini_stt(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | 
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# --- /start: ovoz tanlashni so'raymiz ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    """/start — AI salomlashuv, so'ng AI suhbat rejimi."""
     uid = message.from_user.id
-    user_data[uid] = {"voice": DEFAULT_VOICE}
-    await state.clear()
+    user_data[uid] = {"history": []}
+    await state.set_state(Flow.ai_chat)
+    await typing(message)
 
-    await message.answer(
-        "🎙️ <b>Ovoz Bot'ga xush kelibsiz!</b>\n\n"
-        "Men ikkala yo'nalishda ishlayman:\n"
-        "1️⃣ <b>Matn → Ovoz</b> — yozgan matningizni ovozli xabar qilaman\n"
-        "2️⃣ <b>Ovoz → Matn</b> — ovozli xabaringizni matnga aylantiraman\n\n"
-        "Avval <b>ovozni tanlang</b> (matn → ovoz rejimi uchun):\n",
-        parse_mode=ParseMode.HTML,
-        reply_markup=voice_category_keyboard(),
-    )
+    greeting = None
+    if GEMINI_API_KEY:
+        greeting = await gemini_chat(
+            "Foydalanuvchi botni yangi boshladi (start bosdi).",
+            GREETING_SYSTEM,
+        )
+    if greeting:
+        # AI matni oddiy matn sifatida yuboriladi (HTML/markdown belgilar uchun xavfsiz)
+        await message.answer(clip(clean_ai_text(greeting), 3900))
+    else:
+        await message.answer(clip(DEFAULT_GREETING, 3900), parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
         "ℹ️ <b>Yo'riqnoma</b>\n\n"
-        "1️⃣ /start — boshlash, ovoz tanlash\n"
-        "2️⃣ Rejimni tanlang:\n"
-        "   • 1️⃣ Matn → Ovoz (matn yozasiz, ovoz olasiz)\n"
-        "   • 2️⃣ Ovoz → Matn (ovoz yuborasiz, matn olasiz)\n\n"
-        "⚠️ Maksimal matn: ~3000 belgi\n"
-        "⚠️ Maksimal ovoz: 5 daqiqa",
+        "Men AI yordamchiman — oddiygina yozing yoki ovoz yuboring:\n\n"
+        "🔊 <b>Matn → Ovoz</b> — 'Salom, bugun ob-havo zo'r' deb yozing\n"
+        "🎤 <b>Ovoz → Matn</b> — mikrofon tugmasini bosib gapiring\n"
+        "👴 <b>Grandpa effekti</b> — 'Grandpa ovozida aylantir: ...'\n"
+        "🎭 <b>Senariy</b> — qahramonlari bilan dialog yuboring, "
+        "har biriga alohida ovoz beraman\n"
+        "💬 <b>Suhbat</b> — har qanday savol bering\n\n"
+        "Buyruqlar:\n"
+        "/start — qaytadan boshlash\n"
+        "/reset — suhbat tarixini tozalash\n\n"
+        "⚠️ Maksimal ovoz xabari: 5 daqiqa",
         parse_mode=ParseMode.HTML,
     )
 
 
-# --- Ovoz kategoriyasi tanlandi ---
-@dp.callback_query(F.data.startswith("cat:"))
-async def category_selected(callback: CallbackQuery):
-    category = callback.data[4:]
-    await callback.message.edit_text(
-        f"🎙️ <b>{category}</b> — ovozni tanlang:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=voice_list_keyboard(category),
-    )
-    await callback.answer()
-
-
-# --- Orqaga tugmasi ---
-@dp.callback_query(F.data == "back_to_cats")
-async def back_to_cats(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🎙️ <b>Ovoz kategoriyasini tanlang:</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=voice_category_keyboard(),
-    )
-    await callback.answer()
-
-
-# --- OVOZ TANLANDI → rejani so'raymiz ---
-@dp.callback_query(F.data.startswith("vsel:"))
-async def voice_selected(callback: CallbackQuery, state: FSMContext):
-    uid = callback.from_user.id
-    voice_id = callback.data.split(":", 1)[1]
-
-    if uid not in user_data:
-        user_data[uid] = {}
-    user_data[uid]["voice"] = voice_id
-
-    voice_name = "Default"
-    for name, vid in ALL_VOICES.items():
-        if vid == voice_id:
-            voice_name = name
-            break
-
-    await callback.message.edit_text(
-        f"✅ Ovoz tanlandi: <b>{voice_name}</b>\n\n"
-        "Endi rejani tanlang:",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-    await callback.message.answer(
-        "📋 <b>Qaysi rejimda ishlaysiz?</b>\n\n"
-        "1️⃣ <b>Matn → Ovoz</b>\n"
-        "    Matn yozaman, ovozli xabar olaman\n\n"
-        "2️⃣ <b>Ovoz → Matn</b>\n"
-        "    Ovoz yuboraman, matn olaman",
-        parse_mode=ParseMode.HTML,
-        reply_markup=mode_keyboard(),
-    )
-    await state.set_state(Flow.choosing_mode)
-
-
-# --- REJAMI TANLANDI ---
-@dp.message(F.text == "🔄 Boshidan boshlash")
-async def restart(message: Message, state: FSMContext):
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message, state: FSMContext):
     uid = message.from_user.id
-    user_data[uid] = {"voice": DEFAULT_VOICE}
-    await state.clear()
-
+    user_data[uid] = {"history": []}
+    await state.set_state(Flow.ai_chat)
     await message.answer(
-        "🔄 <b>Qaytadan boshlaymiz!</b>\n\n"
-        "Avval <b>ovozni tanlang:</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=voice_category_keyboard(),
+        "🔄 Suhbat tarixi tozalandi. Qaytadan boshlaymiz — yozing yoki ovoz yuboring! 😊"
     )
 
 
-@dp.message(Flow.choosing_mode)
-async def mode_chosen(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
+@dp.message(F.voice | F.audio)
+async def voice_message_handler(message: Message, state: FSMContext):
+    """Ovozli xabar -> Gemini STT -> matnga aylantirib, AI oqimiga beradi."""
+    await state.set_state(Flow.ai_chat)
 
-    if "Matn → Ovoz" in text or "1️⃣" in text:
-        await message.answer(
-            "📝 <b>Matn → Ovoz rejimi</b>\n\n"
-            "Matn yozing — men uni ovozga aylantirib beraman:",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(Flow.waiting_tts_text)
-
-    elif "Ovoz → Matn" in text or "2️⃣" in text:
-        await message.answer(
-            "🎙️ <b>Ovoz → Matn rejimi</b>\n\n"
-            "Endi <b>ovozli xabar</b> yuboring (mikrofon tugmasi) —\n"
-            "men uni matnga aylantirib beraman.\n\n"
-            "Tilni avtomatik aniqlayman 🌍",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(Flow.waiting_stt)
-
-    elif "Grandpa" in text or "👴" in text:
-        await message.answer(
-            "👴 <b>Grandpa Effekti</b>\n\n"
-            "Matn yozing — men uni <b>keksa odam ovozida</b> aylantirib beraman:\n"
-            "• Pastroq va tabiiy tembr\n"
-            "• Biroz dag'al, xirillagan\n"
-            "• Nutq tushunarli va ravon\n\n"
-            "Boshqa ovoz rejimi uchun /start bosing.",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(Flow.waiting_grandpa_text)
-
-    elif "AI Yordamchi" in text or "🤖" in text:
-        await message.answer(
-            "🤖 <b>AI Yordamchi</b>\n\n"
-            "Men sizga yordam bera olaman! Savolingizni yozing:\n"
-            "• Bot haqida savollar\n"
-            "• Ovoz yaratish bo'yicha maslahat\n"
-            "• Har qanday umumiy savol\n\n"
-            "Chiqish uchun /start bosing.",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(Flow.ai_chat)
-
-    elif "Senariy" in text or "📜" in text:
-        await message.answer(
-            "📜 <b>Senariy Tahlili</b>\n\n"
-            "Senariy matnini yuboring — men uni tahlil qilaman:\n"
-            "• Tuzilish (boshlash, rivojlanish, yakun)\n"
-            "• Qahramonlar\n"
-            "• Asosiy g'oya\n"
-            "• Ovoz yozish tavsiyalari\n\n"
-            "Chiqish uchun /start bosing.",
-            parse_mode=ParseMode.HTML,
-        )
-        await state.set_state(Flow.waiting_script)
-
-    else:
-        await message.answer(
-            "⚠️ Iltimos, tugmalardan birini tanlang:",
-            reply_markup=mode_keyboard(),
-        )
-
-
-# =============================================
-# 1) MATN → OVOZ (TTS)
-# =============================================
-
-@dp.message(Flow.waiting_tts_text)
-async def tts_text_handler(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    uid = message.from_user.id
-
-    if not text:
-        await message.answer("⚠️ Iltimos, matn yozing.")
-        return
-
-    if len(text) > 3000:
-        await message.answer("⚠️ Matn juda uzun! 3000 belgidan qisqaroq yozing.")
-        return
-
-    voice_id = user_data.get(uid, {}).get("voice", DEFAULT_VOICE)
-    processing_msg = await message.answer("🧠 Matn tahlil qilinmoqda...")
-
-    try:
-        improved_text = await improve_prompt(text, mode="tts")
-        logger.info(f"TTS matn: {improved_text[:80]}...")
-
-        await processing_msg.edit_text("⏳ Ovoz yaratilmoqda...")
-
-        audio_bytes = await text_to_speech(improved_text, voice_id)
-
-        if audio_bytes is None:
-            await processing_msg.edit_text(
-                "❌ Xatolik yuz berdi. Qayta urinib ko'ring."
-            )
-            return
-
-        audio_file = BufferedInputFile(audio_bytes, filename="voice.mp3")
-        await message.answer_voice(
-            voice=audio_file,
-            caption=f"🔊 {len(text)} belgi",
-        )
-        await processing_msg.delete()
-
-        await message.answer(
-            "🔄 Yana ishlash uchun yoki boshqa rejimga o'tish:",
-            reply_markup=restart_keyboard(),
-        )
-
-    except Exception as e:
-        logger.error(f"TTS xatosi: {e}")
-        await processing_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
-
-
-# =============================================
-# 1b) GRANDPA EFFEKTI (Matn → Keksa Ovoz)
-# =============================================
-
-@dp.message(Flow.waiting_grandpa_text)
-async def grandpa_text_handler(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    uid = message.from_user.id
-
-    if not text:
-        await message.answer("⚠️ Iltimos, matn yozing.")
-        return
-
-    if len(text) > 2000:
-        await message.answer("⚠️ Matn juda uzun! 2000 belgidan qisqaroq yozing.")
-        return
-
-    voice_id = user_data.get(uid, {}).get("voice", DEFAULT_VOICE)
-    processing_msg = await message.answer("🧠 Matn tahlil qilinmoqda...")
-
-    try:
-        improved_text = await improve_prompt(text, mode="tts")
-        logger.info(f"Grandpa matn: {improved_text[:80]}...")
-
-        await processing_msg.edit_text("⏳ Ovoz yaratilmoqda...")
-
-        audio_bytes = await text_to_speech(improved_text, voice_id)
-
-        if audio_bytes is None:
-            await processing_msg.edit_text(
-                "❌ Ovoz yaratishda xatolik. Qayta urinib ko'ring."
-            )
-            return
-
-        await processing_msg.edit_text("👴 Grandpa effekti qo'llanmoqda...")
-
-        processed_bytes = await apply_grandpa_effect(audio_bytes)
-
-        if processed_bytes is None:
-            # Effekt muvaffaqiyatsiz bo'lsa — oddiy ovozni yuboramiz
-            logger.warning("Grandpa effekti ishlamadi, oddiy ovoz yuboriladi")
-            processed_bytes = audio_bytes
-
-        audio_file = BufferedInputFile(processed_bytes, filename="grandpa_voice.mp3")
-        await message.answer_voice(
-            voice=audio_file,
-            caption=f"👴 Grandpa effekti | {len(text)} belgi",
-        )
-        await processing_msg.delete()
-
-        await message.answer(
-            "🔄 Yana ishlash uchun yoki boshqa rejimga o'tish:",
-            reply_markup=restart_keyboard(),
-        )
-
-    except Exception as e:
-        logger.error(f"Grandpa xatosi: {e}")
-        await processing_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
-
-
-# =============================================
-# 3) AI YORDAMCHI (Gemini)
-# =============================================
-
-@dp.message(Flow.ai_chat)
-async def ai_chat_handler(message: Message, state: FSMContext):
-    """AI yordamchi bilan suhbat."""
-    text = (message.text or "").strip()
-
-    if not text:
-        await message.answer("⚠️ Iltimos, savolingizni yozing.")
-        return
-
-    processing_msg = await message.answer("🤖 Javob tayyorlanmoqda...")
-
-    try:
-        response = await gemini_bot_help(text)
-
-        if response:
-            # Juda uzun javoblarni kesish (Telegram cheklovi)
-            if len(response) > 4000:
-                response = response[:4000] + "..."
-            await processing_msg.edit_text(response)
-        else:
-            await processing_msg.edit_text(
-                "❌ Javob olishda xatolik. Qayta urinib ko'ring."
-            )
-
-    except Exception as e:
-        logger.error(f"AI chat xatosi: {e}")
-        await processing_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
-
-
-# =============================================
-# 4) SENARIY TAHLILI (Gemini)
-# =============================================
-
-@dp.message(Flow.waiting_script)
-async def script_analysis_handler(message: Message, state: FSMContext):
-    """Senariyni tahlil qiladi."""
-    text = (message.text or "").strip()
-
-    if not text:
-        await message.answer("⚠️ Iltimos, senariy matnini yuboring.")
-        return
-
-    if len(text) < 50:
-        await message.answer("⚠️ Senariy juda qisqa. Kamida 50 belgi yuboring.")
-        return
-
-    if len(text) > 10000:
-        await message.answer("⚠️ Senariy juda uzun! 10000 belgidan qisqaroq yuboring.")
-        return
-
-    processing_msg = await message.answer("📜 Senariy tahlil qilinmoqda...")
-
-    try:
-        analysis = await gemini_analyze_script(text)
-
-        if analysis:
-            if len(analysis) > 4000:
-                analysis = analysis[:4000] + "..."
-            await processing_msg.edit_text(
-                f"📜 <b>Senariy Tahlili:</b>\n\n{analysis}",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await processing_msg.edit_text(
-                "❌ Tahlilda xatolik. Qayta urinib ko'ring."
-            )
-
-    except Exception as e:
-        logger.error(f"Senariy tahlili xatosi: {e}")
-        await processing_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
-
-
-# =============================================
-# 2) OVOZ → MATN (STT)
-# =============================================
-
-@dp.message(Flow.waiting_stt, F.voice | F.audio)
-async def stt_voice_handler(message: Message, state: FSMContext):
-    """Ovozli xabarni matnga aylantiradi (Gemini STT)."""
     tg_file = message.voice or message.audio
-
-    # Davomiylik tekshiruvi
     duration = tg_file.duration or 0
     if duration > MAX_VOICE_SECONDS:
         await message.answer(
-            f"⚠️ Ovoz juda uzun ({duration}s). Maksimal {MAX_VOICE_SECONDS} soniya."
+            f"⚠️ Ovoz juda uzun ({duration} s). Maksimal {MAX_VOICE_SECONDS} soniya."
         )
         return
 
-    processing_msg = await message.answer(
-        "🧠 Ovoz tahlil qilinmoqda...\n"
-        "⏳ Bir necha soniya kuting."
-    )
+    processing = await message.answer("🎤 Ovoz tinglanmoqda...")
+    tmp_path = TMP_DIR / f"stt_{uuid.uuid4().hex[:12]}.ogg"
 
-    tmp_path = None
     try:
-        # Faylni yuklab olish
         file = await message.bot.get_file(tg_file.file_id)
-        tmp_dir = os.path.join(os.getcwd(), "tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
-        ext = "ogg" if message.voice else "mp3"
-        tmp_path = os.path.join(tmp_dir, f"{message.from_user.id}_{tg_file.file_id}.{ext}")
-
-        await message.bot.download_file(file.file_path, destination=tmp_path)
-        logger.info(f"STT: fayl yuklandi {tmp_path} ({duration}s)")
-
-        await processing_msg.edit_text("⏳ Matnga aylantirilmoqda...")
-
-        # Gemini STT — ovoz faylini o'qib, matnga aylantiradi
-        with open(tmp_path, "rb") as f:
-            audio_bytes = f.read()
+        await message.bot.download_file(file.file_path, destination=str(tmp_path))
+        audio_bytes = tmp_path.read_bytes()
         mime_type = "audio/ogg" if message.voice else "audio/mpeg"
-        raw_text = await gemini_stt(audio_bytes, mime_type)
 
-        if not raw_text:
-            await processing_msg.edit_text(
-                "❌ Ovozdan matn topilmadi.\n"
-                "Iltimos, aniqroq va yaqinroq gapiring."
+        await safe_edit(processing, "⏳ Matnga aylantirilmoqda...")
+        transcript = await gemini_stt(audio_bytes, mime_type)
+
+        if not transcript:
+            await safe_edit(
+                processing,
+                "❌ Ovozdan matn topilmadim.\nIltimos, aniqroq va yaqinroq gapiring.",
             )
             return
 
-        logger.info(f"STT natija: {raw_text[:100]}")
+        cleaned = (await improve_prompt(transcript, mode="stt")).strip() or transcript
+        logger.info(f"STT natija: {cleaned[:100]}")
 
-        # Thinking model bilan tozalash
-        await processing_msg.edit_text("🧹 Matn tozalanmoqda...")
-        cleaned = await improve_prompt(raw_text, mode="stt")
-
-        await processing_msg.edit_text(
-            f"✅ <b>Tayyor!</b>\n\n"
-            f"📝 {cleaned}",
-            parse_mode=ParseMode.HTML,
-        )
-
-        await message.answer(
-            "🔄 Yana ishlash uchun yoki boshqa rejimga o'tish:",
-            reply_markup=restart_keyboard(),
-        )
-
-    except Exception as e:
-        logger.error(f"STT xatosi: {e}")
-        await processing_msg.edit_text(f"❌ Xatolik: {str(e)[:200]}")
     finally:
         # Vaqtinchalik faylni o'chirish
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await safe_edit(processing, f"🗣️ «{clip(cleaned, 500)}»\n\n🧠 Davom etilmoqda...")
+    await run_pipeline(message, cleaned, processing)
 
 
-@dp.message(Flow.waiting_stt)
-async def stt_wrong_type(message: Message):
+@dp.message(F.text)
+async def text_message_handler(message: Message, state: FSMContext):
+    """AI suhbat rejimi — matn keladi, Gemini niyatni aniqlaydi."""
+    await state.set_state(Flow.ai_chat)
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    processing = await message.answer("🧠 Tahlil qilinmoqda...")
+    await run_pipeline(message, text, processing)
+
+
+@dp.message()
+async def other_content_handler(message: Message):
+    """Boshqa kontent turlari (stiker, rasm, hujjat...)."""
     await message.answer(
-        "⚠️ Iltimos, <b>ovozli xabar</b> yuboring (mikrofon tugmasi bosib ushlab turing).",
+        "😊 Men hozircha <b>matn</b> va <b>ovozli xabar</b>lar bilan ishlayman.\n"
+        "Matn yozing yoki mikrofon tugmasini bosib ovoz yuboring!",
         parse_mode=ParseMode.HTML,
     )
-
 
 
 # =============================================
 # ISHGA TUSHIRISH
 # =============================================
 
+
 async def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN topilmadi! .env faylni tekshiring.")
         return
+    if not GEMINI_API_KEY:
+        logger.warning("MIYYA_API_KEY topilmadi — AI funksiyalar (chat/STT/intent) ishlamaydi.")
     if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY topilmadi! .env faylni tekshiring.")
-        return
+        logger.warning("OPENROUTER_API_KEY topilmadi — Fish Audio TTS ishlamaydi.")
+    if not OPENROUTER_THINKING_KEY:
+        logger.warning("OPENROUTER_THINKING_KEY topilmadi — matnni tayyorlash o'tkaziladi.")
+    if not GTTS_AVAILABLE:
+        logger.warning("gTTS o'rnatilmagan — TTS faqat Fish Audio orqali ishlaydi.")
 
     bot = Bot(token=BOT_TOKEN)
-    logger.info("Bot ishga tushdi!")
+    logger.info("AI Ovoz Bot ishga tushdi!")
     await dp.start_polling(bot)
 
 
