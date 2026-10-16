@@ -34,7 +34,7 @@ import aiohttp
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_THINKING_KEY = os.getenv("OPENROUTER_THINKING_KEY")
 GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")
