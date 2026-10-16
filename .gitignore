@@ -1,0 +1,18 @@
+# Maxfiy fayllar
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Vaqtinchalik fayllar
+tmp/
+*.wav
+*.mp3
+
+# IDE
+.vscode/
+.idea/
