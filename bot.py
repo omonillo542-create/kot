@@ -160,7 +160,8 @@ user_data: dict[int, dict] = {}
 
 
 class Flow(StatesGroup):
-    ai_chat = State()  # AI suhbat rejimi (asosiy holat)
+    ai_chat = State()     # AI suhbat rejimi (asosiy holat)
+    broadcast = State()   # Admin: broadcast matni kutilmoqda
 
 
 # =============================================
@@ -1706,6 +1707,123 @@ async def speed_callback(callback: CallbackQuery):
         text += await settings_summary(uid)
         await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
     await callback.answer()
+
+
+# =============================================
+# ADMIN PANEL (faqat ADMIN_IDS uchun)
+# Matn handlerlaridan OLDIN — aks holda
+# broadcast rejimi ishlamaydi (aiogram tartibi).
+# =============================================
+
+
+def is_admin(user_id: int) -> bool:
+    """Foydalanuvchi adminmi?"""
+    return user_id in ADMIN_IDS
+
+
+def build_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stats"),
+            InlineKeyboardButton(text="📤 Broadcast", callback_data="admin:broadcast"),
+        ],
+    ])
+
+
+async def admin_stats_text() -> str:
+    users = await db.get_total_users()
+    today = await db.get_today_requests()
+    total = await db.get_total_requests()
+    return (
+        T.ADMIN_HEADER + "\n"
+        + T.ADMIN_STATS.format(users=users, today=today, total=total)
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    """/admin — admin panel (faqat adminlar uchun)."""
+    if not is_admin(message.from_user.id):
+        await message.answer(T.ERR_NOT_ADMIN)
+        return
+    await message.answer(
+        await admin_stats_text(),
+        reply_markup=build_admin_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def admin_callback(callback: CallbackQuery, state: FSMContext):
+    """Admin tugmalari boshqaruvi."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer(T.ERR_NOT_ADMIN, show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+
+    if action == "stats":
+        await callback.message.edit_text(
+            await admin_stats_text(),
+            reply_markup=build_admin_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif action == "broadcast":
+        # Broadcast rejimiga o'tamiz
+        await state.set_state(Flow.broadcast)
+        await callback.message.edit_text(
+            T.ADMIN_BROADCAST_PROMPT,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel")],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif action == "cancel":
+        await state.set_state(Flow.ai_chat)
+        await callback.message.edit_text(
+            T.ADMIN_CANCELLED,
+            reply_markup=build_admin_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    await callback.answer()
+
+
+@dp.message(Flow.broadcast)
+async def broadcast_handler(message: Message, state: FSMContext):
+    """Broadcast rejimida kelgan matnni barcha foydalanuvchilarga yuboradi."""
+    if not is_admin(message.from_user.id):
+        await state.set_state(Flow.ai_chat)
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer(T.ERR_EMPTY_TEXT)
+        return
+
+    user_ids = await db.get_all_user_ids()
+    await message.answer(
+        T.ADMIN_BROADCAST_START.format(count=len(user_ids)),
+        parse_mode=ParseMode.HTML,
+    )
+
+    sent = 0
+    for uid in user_ids:
+        try:
+            await message.bot.send_message(uid, text)
+            sent += 1
+        except Exception as e:
+            logger.debug(f"Broadcast xatosi (user {uid}): {e}")
+        # Telegram limitiga tushmaslik uchun kichik pauza
+        await asyncio.sleep(0.05)
+
+    await state.set_state(Flow.ai_chat)
+    await message.answer(
+        T.ADMIN_BROADCAST_DONE.format(sent=sent, total=len(user_ids)),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.message(F.voice | F.audio)
