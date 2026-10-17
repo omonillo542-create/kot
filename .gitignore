@@ -20,6 +20,11 @@ bot.db
 # Test fayllari va artefaktlar
 test_*.py
 test_fayl.*
+changelog.txt
+
+# Virtual muhit
+venv*/
+.venv/
 
 # IDE
 .vscode/

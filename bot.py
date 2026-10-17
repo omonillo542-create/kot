@@ -68,15 +68,21 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import texts as T
 import database as db
 
-# --- Edge TTS 403 fix: Microsoft yangi endpointga o'tgan ---
-# GitHub issue #490 da tasdiqlangan workaround: yangi host + eski token
+# --- Edge TTS 403 fix (faqat eski versiyalar uchun) ---
+# edge-tts 7.3.0+ da v2 token qo'llab-quvvatlanadi — native URL to'g'ri ishlaydi.
+# Faqat 7.2.x da Microsoft endpoint yopilgani uchun yangi hostga o'tkazamiz.
 try:
-    from edge_tts.constants import TRUSTED_CLIENT_TOKEN
-    import edge_tts.communicate as _edge_cm
-    _edge_cm.WSS_URL = (
-        "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
-        f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
+    import edge_tts as _edge_ver
+    _ver_parts = tuple(
+        int(x) for x in getattr(_edge_ver, "__version__", "0").split(".")[:2]
     )
+    if _ver_parts < (7, 3):
+        from edge_tts.constants import TRUSTED_CLIENT_TOKEN
+        import edge_tts.communicate as _edge_cm
+        _edge_cm.WSS_URL = (
+            "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+            f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
+        )
 except Exception:
     pass
 
@@ -457,7 +463,10 @@ async def edge_tts_speak(
             logger.warning(f"Edge TTS juda kichik audio qaytardi ({len(audio)} bayt)")
             return None
         except Exception as e:
-            logger.warning(f"Edge TTS xatosi (urinish {attempt + 1}/{retries + 1}): {e}")
+            logger.warning(
+                f"Edge TTS xatosi (urinish {attempt + 1}/{retries + 1}, "
+                f"voice={voice}): {type(e).__name__}: {e}"
+            )
             if attempt < retries:
                 await asyncio.sleep(1.0 * (attempt + 1))
     return None
@@ -1751,6 +1760,46 @@ async def cmd_admin(message: Message):
         reply_markup=build_admin_keyboard(),
         parse_mode=ParseMode.HTML,
     )
+
+
+@dp.message(Command("diag"))
+async def cmd_diag(message: Message):
+    """/diag — TTS dvigatellarini tekshirish (faqat adminlar uchun)."""
+    if not is_admin(message.from_user.id):
+        await message.answer(T.ERR_NOT_ADMIN)
+        return
+
+    import edge_tts as _et
+    lines = [f"🧪 <b>Diagnostics</b>", f"edge-tts: {_et.__version__}", ""]
+
+    # 1) Edge TTS
+    try:
+        audio = await edge_tts_speak("Sinov.", "uz-UZ-SardorNeural", retries=0)
+        lines.append(
+            f"Edge TTS: ✅ {len(audio)} bayt" if audio else "Edge TTS: ❌ audio yo'q"
+        )
+    except Exception as e:
+        lines.append(f"Edge TTS: ❌ {type(e).__name__}: {str(e)[:200]}")
+
+    # 2) Kokoro
+    try:
+        audio = await kokoro_tts("Sinov.")
+        lines.append(
+            f"Kokoro: ✅ {len(audio)} bayt" if audio else "Kokoro: ❌ ishlamadi (Space uxlayapti?)"
+        )
+    except Exception as e:
+        lines.append(f"Kokoro: ❌ {type(e).__name__}: {str(e)[:200]}")
+
+    # 3) Fish Audio
+    try:
+        audio = await fish_audio_tts("Sinov.", None)
+        lines.append(
+            f"Fish Audio: ✅ {len(audio)} bayt" if audio else "Fish Audio: ❌ ishlamadi"
+        )
+    except Exception as e:
+        lines.append(f"Fish Audio: ❌ {type(e).__name__}: {str(e)[:200]}")
+
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @dp.callback_query(F.data.startswith("admin:"))
