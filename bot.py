@@ -1,5 +1,5 @@
 """
-Telegram AI Ovoz Bot — AI-first oqim (to'liq qayta yozilgan)
+Telegram AI Ovoz Bot — AI-first oqim (Kokoro TTS bilan)
 
 OQIM:
   /start  -> AI salomlashuv -> AI suhbat rejimi (ai_chat)
@@ -11,14 +11,12 @@ OQIM:
     5. script   -> Gemini qahramonlarni ajratadi -> har biriga alohida ovoz
     6. aks holda -> o'zbekcha suhbat (tarix bilan)
 
-OVOZ SIFATI:
-  * gTTS — asosiy TTS (matn tili gTTS da qo'llab-quvvatlansa: en, ru, tr, ...).
-    Eslatma: gTTS 2.5.x 'uz' (o'zbek) tilini QO'LLAB-QUVVATLAMAYDI
-    (Google Translate endpointi ham 'Unsupported language uz' qaytaradi),
-    shuning uchun o'zbekcha matn uchun bot avtomatik ravishda Fish Audio
-    (o'zbek ovozlari bilan) ga o'tadi. Boshqa tillar uchun gTTS birinchi.
-  * Fish Audio (OpenRouter) — o'zbekcha va barcha boshqa tillar uchun,
-    shuningdek turli qahramon ovozlari uchun.
+OVOZ DVIGATELLARI (tartib):
+  1. Kokoro TTS — ASOSIY dvigatel (OpenAI-compatible API, barcha tillar)
+     Endpoint: KOKORO_API_URL (default: http://localhost:8880/v1/audio/speech)
+  2. Fish Audio (OpenRouter) — fallback (Kokoro ishlamayotganda)
+  3. gTTS — oxirgi fallback (faqat gTTS qo'llab-quvvatlagan tillar: en, ru, tr, ...)
+     Eslatma: gTTS 'uz' (o'zbek) tilini QO'LLAB-QUVVATLAMAYDI
 
 BARCHA KALITLAR FAQAT .env FAYLDAN OLINADI.
 """
@@ -69,9 +67,15 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_THINKING_KEY = os.getenv("OPENROUTER_THINKING_KEY")
 GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")  # Gemini (Google AI Studio)
 
-# --- Fish Audio TTS (OpenRouter) ---
+# --- Fish Audio TTS (OpenRouter) — fallback sifatida saqlanadi ---
 TTS_API_URL = "https://openrouter.ai/api/v1/audio/speech"
 TTS_MODEL = "fish-audio/s2.1-pro-free:free"
+
+# --- Kokoro TTS (asosiy TTS dvigateli) ---
+KOKORO_API_URL = os.getenv("KOKORO_API_URL", "https://strive33-kokoro-tts-fastapi.hf.space/tts")
+KOKORO_DEFAULT_VOICE = os.getenv("KOKORO_DEFAULT_VOICE", "af_heart")
+KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.0"))
+KOKORO_ENABLED = os.getenv("KOKORO_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # --- Thinking model: matnni ovozli nutqqa tayyorlash ---
 THINKING_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -107,6 +111,41 @@ class Flow(StatesGroup):
 # OVOZLAR KATALOGI (qahramonlar va ovoz so'rovlari uchun)
 # =============================================
 
+# --- Kokoro TTS ovozlari (asosiy) ---
+KOKORO_MALE_VOICES = {
+    "🧔 Erkak (Rasmiy)": "am_michael",
+    "👨 Erkak (Tabiiy)": "am_liam",
+    "🧑 Erkak (Chuqur)": "am_adam",
+    "🧔 Erkak (Do'stona)": "am_eric",
+}
+
+KOKORO_FEMALE_VOICES = {
+    "👩 Ayol (Tabiiy)": "af_heart",
+    "👩‍🦰 Ayol (Expressiv)": "af_bella",
+    "🧘 Ayol (Sokin)": "af_nicole",
+    "👩 Ayol (Suhbatdosh)": "af_sarah",
+}
+
+KOKORO_CHILD_VOICES = {
+    "🧒 Bola (Yosh)": "am_puck",
+    "👶 Bola (Ilmom)": "af_nova",
+}
+
+KOKORO_GRANDPA_VOICES = {
+    "👴 Keksa (Chuqur)": "am_echo",
+    "👴 Keksa (Barqaror)": "am_fenrir",
+    "👴 Keksa (Hikoyachi)": "bm_george",
+}
+
+KOKORO_GENDER_POOLS = {
+    "male": KOKORO_MALE_VOICES,
+    "female": KOKORO_FEMALE_VOICES,
+    "child": KOKORO_CHILD_VOICES,
+}
+
+KOKORO_DEFAULT = KOKORO_DEFAULT_VOICE  # af_heart
+
+# --- Fish Audio ovozlari (fallback) ---
 UZBEK_VOICES = {
     "🧔 Erkak (Rasmiy)": "44ad146afad04e4e99a7b98b8f97106f",
     "👨 Erkak (Tabiiy)": "fef226d2978a42d5b542e7577134f7b2",
@@ -149,15 +188,32 @@ GENDER_LABELS = {"male": "erkak", "female": "ayol", "child": "bola"}
 
 
 def voice_for_gender(gender: str, index: int = 0) -> tuple[str, str]:
-    """Qahramon jinsiga qarab ovoz tanlaydi (takrorlanmaslik uchun index)."""
+    """Qahramon jinsiga qarab ovoz tanlaydi.
+    Kokoro ishlasa — Kokoro ovozi, aks holda Fish Audio ovozi."""
+    if KOKORO_ENABLED:
+        pool = list(KOKORO_GENDER_POOLS.get(gender, KOKORO_MALE_VOICES).items())
+        name, voice_id = pool[index % len(pool)]
+        return voice_id, name
     pool = list(GENDER_POOLS.get(gender, UZBEK_VOICES).items())
     name, voice_id = pool[index % len(pool)]
     return voice_id, name
 
 
 def voice_for_hint(hint: str) -> str:
-    """Foydalanuvchi ovoz so'rovi ('male', 'female', ...) -> Fish Audio voice_id."""
+    """Foydalanuvchi ovoz so'rovi ('male', 'female', ...) -> voice_id."""
     h = (hint or "default").strip().lower()
+
+    if KOKORO_ENABLED:
+        if h in ("male", "erkak"):
+            return list(KOKORO_MALE_VOICES.values())[0]
+        if h in ("female", "ayol", "qiz"):
+            return list(KOKORO_FEMALE_VOICES.values())[0]
+        if h in ("child", "bola", "bolacha"):
+            return list(KOKORO_CHILD_VOICES.values())[0]
+        if h in ("grandpa", "keksa", "bobo"):
+            return list(KOKORO_GRANDPA_VOICES.values())[0]
+        return KOKORO_DEFAULT
+
     if h in ("male", "erkak"):
         return list(MALE_VOICES.values())[0]
     if h in ("female", "ayol", "qiz"):
@@ -244,8 +300,65 @@ async def gtts_speak(text: str, lang: str = "en") -> bytes | None:
         return None
 
 
+async def kokoro_tts(text: str, voice_id: str | None = None) -> bytes | None:
+    """Kokoro TTS (HF Space orqali).
+
+    API formati (strive33/Kokoro-TTS-FastAPI Space):
+      POST {KOKORO_API_URL}
+      {"text": "...", "voice": "af_heart", "speed": 1.0, "output_format": "wav"}
+      -> WAV audio bytes
+    """
+    if not KOKORO_ENABLED:
+        return None
+
+    voice = voice_id or KOKORO_DEFAULT_VOICE
+    payload = {
+        "text": text,
+        "voice": voice,
+        "speed": KOKORO_SPEED,
+        "output_format": "wav",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                KOKORO_API_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"Kokoro TTS xatosi {resp.status}: {error_text[:300]}")
+                    # Agar voice noto'g'ri bo'lsa — default voice bilan qayta urinish
+                    if voice != KOKORO_DEFAULT_VOICE:
+                        payload["voice"] = KOKORO_DEFAULT_VOICE
+                        async with session.post(
+                            KOKORO_API_URL, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=120),
+                        ) as retry:
+                            if retry.status == 200:
+                                data = await retry.read()
+                                if len(data) > 100:
+                                    return data
+                    return None
+
+                data = await resp.read()
+                if len(data) > 100:
+                    return data
+                logger.warning(f"Kokoro TTS juda kichik audio qaytardi ({len(data)} bayt)")
+                return None
+    except aiohttp.ClientConnectorError:
+        logger.warning(f"Kokoro TTS serverga ulanib bo'lmadi: {KOKORO_API_URL}")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning("Kokoro TTS timeout (120s)")
+        return None
+    except Exception as e:
+        logger.error(f"Kokoro TTS xatosi: {e}")
+        return None
+
+
 async def fish_audio_tts(text: str, voice_id: str | None = None) -> bytes | None:
-    """Fish Audio TTS (OpenRouter orqali)."""
+    """Fish Audio TTS (OpenRouter orqali) — Kokoro ishlamayotganda fallback."""
     if not OPENROUTER_API_KEY:
         logger.warning("OPENROUTER_API_KEY topilmadi — Fish Audio TTS ishlamaydi")
         return None
@@ -309,29 +422,38 @@ async def synthesize_speech(
 ) -> tuple[bytes | None, str]:
     """
     Matnni ovozga aylantiradi.
-    - gTTS birinchi (matn tili gTTS da qo'llab-quvvatlansa: en, ru, tr, ...)
-    - Fish Audio ikkinchi (o'zbekcha va aniq ovoz so'ralsa birinchi)
+    - Kokoro TTS birinchi (asosiy dvigatel, barcha tillar uchun)
+    - Fish Audio ikkinchi (Kokoro ishlamayotganda fallback)
+    - gTTS uchinchi (Kokoro va Fish Audio ishlamayotganda)
     Qaytadi: (audio_bytes | None, qaysi dvigatel ishlatildi)
     """
     text = (text or "").strip()
     if not text:
         return None, ""
 
-    gtts_ok = lang in GTTS_LANGS
+    kokoro_ok = KOKORO_ENABLED
     fish_ok = bool(OPENROUTER_API_KEY)
+    gtts_ok = lang in GTTS_LANGS
 
-    if prefer_fish:
-        order = (["fish"] if fish_ok else []) + (["gtts"] if gtts_ok else [])
-    else:
-        order = (["gtts"] if gtts_ok else []) + (["fish"] if fish_ok else [])
+    # Kokoro har doim birinchi (barcha tillar uchun ishlaydi)
+    order = []
+    if kokoro_ok:
+        order.append("kokoro")
+    if fish_ok:
+        order.append("fish")
+    if gtts_ok:
+        order.append("gtts")
 
     for engine in order:
-        if engine == "gtts":
-            audio = await gtts_speak(text, lang)
-            label = "gTTS"
-        else:
+        if engine == "kokoro":
+            audio = await kokoro_tts(text, voice_id)
+            label = "Kokoro TTS"
+        elif engine == "fish":
             audio = await fish_audio_tts(text, voice_id)
             label = "Fish Audio"
+        else:
+            audio = await gtts_speak(text, lang)
+            label = "gTTS"
         if audio:
             return audio, label
 
@@ -998,9 +1120,11 @@ async def do_script(message: Message, processing: Message, text: str) -> None:
             )
             await typing(message)
 
-            # Qahramon ovozlari uchun Fish Audio (har xil ovozlar kerak),
-            # u ishlamasa — gTTS ga fallback
-            audio = await fish_audio_tts(part, voice_id)
+            # Qahramon ovozlari uchun Kokoro (har xil ovozlar kerak),
+            # u ishlamasa — Fish Audio -> gTTS ga fallback
+            audio = await kokoro_tts(part, voice_id)
+            if not audio:
+                audio = await fish_audio_tts(part, voice_id)
             if not audio:
                 audio = await gtts_speak(part, lang)
 
