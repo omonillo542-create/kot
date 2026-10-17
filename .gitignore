@@ -12,6 +12,14 @@ __pycache__/
 tmp/
 *.wav
 *.mp3
+*.ogg
+
+# Baza (foydalanuvchi ma'lumotlari — commit qilinmaydi)
+bot.db
+
+# Test fayllari va artefaktlar
+test_*.py
+test_fayl.*
 
 # IDE
 .vscode/

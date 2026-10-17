@@ -29,7 +29,10 @@ import uuid
 import asyncio
 import logging
 import base64
+import tempfile
 from pathlib import Path
+
+import edge_tts
 
 from dotenv import load_dotenv
 import imageio_ffmpeg
@@ -51,11 +54,31 @@ except ImportError:  # gTTS o'rnatilmagan bo'lsa — bot Fish Audio bilan ishlav
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import (
+    Message, BufferedInputFile, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineQuery, InlineQueryResultVoice, InlineQueryResultArticle,
+    InputTextMessageContent,
+)
 from aiogram.enums import ParseMode, ChatAction
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+
+import texts as T
+import database as db
+
+# --- Edge TTS 403 fix: Microsoft yangi endpointga o'tgan ---
+# GitHub issue #490 da tasdiqlangan workaround: yangi host + eski token
+try:
+    from edge_tts.constants import TRUSTED_CLIENT_TOKEN
+    import edge_tts.communicate as _edge_cm
+    _edge_cm.WSS_URL = (
+        "wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"
+        f"?Ocp-Apim-Subscription-Key={TRUSTED_CLIENT_TOKEN}"
+    )
+except Exception:
+    pass
 
 load_dotenv()
 
@@ -90,6 +113,39 @@ MAX_VOICE_SECONDS = 300     # 5 daqiqa
 TG_MSG_LIMIT = 4000         # Telegram xabar chegarasi (4096) dan xavfsiz
 MAX_SCRIPT_CHARS = 1200     # bitta qahramon audio bo'lakchasi
 MAX_SCRIPT_CHARACTERS = 10  # senariyda ishlanadigan qahramonlar soni
+MAX_TEXT_CHARS = 15000      # TTS uchun maksimal matn uzunligi
+MAX_CHUNK_CHARS = 3000      # bitta ovoz bo'lakchasi uchun maksimal belgi
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "50"))  # kunlik so'rovlar (0 = cheklovsiz)
+FILE_SIZE_LIMIT_MB = 10     # fayl hajmi limiti (MB)
+ADMIN_IDS = [
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+]
+
+# --- Edge TTS (asosiy TTS dvigateli — bepul, o'zbekcha qo'llab-quvvatlaydi) ---
+EDGE_TTS_VOICES = {
+    "uz": {
+        "male": "uz-UZ-SardorNeural",
+        "female": "uz-UZ-MadinaNeural",
+    },
+    "ru": {
+        "male": "ru-RU-DmitryNeural",
+        "female": "ru-RU-SvetlanaNeural",
+    },
+    "en": {
+        "male": "en-US-GuyNeural",
+        "female": "en-US-JennyNeural",
+    },
+}
+
+EDGE_TTS_RATES = {
+    "slow": "-20%",
+    "normal": "+0%",
+    "fast": "+25%",
+}
+
+LANG_LABELS = {"uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Rus", "en": "🇬🇧 Ingliz"}
+GENDER_LABELS_UI = {"male": "🧔 Erkak", "female": "👩 Ayol"}
+SPEED_LABELS = {"slow": "🐢 Sekin", "normal": "🚶 Normal", "fast": "⚡ Tez"}
 
 # --- Logger ---
 logging.basicConfig(level=logging.INFO)
@@ -249,6 +305,92 @@ def clean_ai_text(text: str) -> str:
     return text.strip()
 
 
+def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Uzun matnni ovoz uchun qulay bo'laklarga bo'ladi.
+
+    Bo'lish tartibi:
+      1. Abzats (\n\n) chegarasida
+      2. Gap (., !, ?, ...) chegarasida
+      3. So'z o'rtasida (so'zni O'RTASIDAN kesma emas!)
+
+    Har bo'lak max_chars belgidan oshmaydi.
+    """
+    text = (text or "").strip()
+    if not text or len(text) <= max_chars:
+        return [text] if text else []
+
+    chunks = []
+
+    # 1) Avval abzats bo'yicha bo'lamiz
+    paragraphs = re.split(r"\n\s*\n", text)
+    current = ""
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        # Agar bitta abzats o'zi juda uzun bo'lsa — gap bo'yicha bo'lamiz
+        if len(para) > max_chars:
+            # Avval joriy bo'lakni saqlaymiz
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_chunk_by_sentences(para, max_chars))
+            continue
+
+        # Abzats qo'shsak hajm oshmasa — qo'shamiz
+        if current and len(current) + len(para) + 2 > max_chars:
+            chunks.append(current)
+            current = para
+        else:
+            current = f"{current}\n\n{para}" if current else para
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _chunk_by_sentences(text: str, max_chars: int) -> list[str]:
+    """Matnni gaplar bo'yicha bo'laklarga bo'ladi (yordamchi funksiya)."""
+    # Gap oxirlarini topamiz: . ! ? ... (lekin raqamlardan keyingi nuqtani emas)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks = []
+    current = ""
+
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+
+        # Bitta gap o'zi juda uzun bo'lsa — so'zlar bilan bo'lamiz
+        if len(sent) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            words = sent.split()
+            for w in words:
+                if current and len(current) + len(w) + 1 > max_chars:
+                    chunks.append(current)
+                    current = w
+                else:
+                    current = f"{current} {w}" if current else w
+            continue
+
+        # Gap qo'shsak hajm oshmasa — qo'shamiz
+        if current and len(current) + len(sent) + 1 > max_chars:
+            chunks.append(current)
+            current = sent
+        else:
+            current = f"{current} {sent}" if current else sent
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
 async def safe_edit(msg: Message | None, text: str) -> None:
     """Xabar tahrirlashda xato qaytarmasligi uchun (message is not modified va h.k.)."""
     if msg is None:
@@ -275,9 +417,100 @@ async def typing(message: Message) -> None:
         pass
 
 
+async def record_voice(message: Message) -> None:
+    """Foydalanuvchiga 'ovoz yozilmoqda' ko'rsatadi."""
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
+    except Exception:
+        pass
+
+
 # =============================================
-# TTS: gTTS (asosiy) + Fish Audio (ikkinchi)
+# TTS: Edge TTS (asosiy) + Kokoro + Fish Audio + gTTS
 # =============================================
+
+
+async def edge_tts_speak(
+    text: str,
+    voice: str | None = None,
+    rate: str = "+0%",
+    retries: int = 2,
+) -> bytes | None:
+    """Edge TTS — Microsoft Edge ovoz sintezi (bepul, o'zbekcha qo'llab-quvvatlaydi).
+
+    Qaytaradi: MP3 audio bytes.
+    Ulanish uzilsa `retries` marta qayta urinadi.
+    """
+    if not voice:
+        voice = EDGE_TTS_VOICES.get("uz", {}).get("male", "uz-UZ-SardorNeural")
+
+    for attempt in range(retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate)
+            audio = b""
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio += chunk["data"]
+            if audio and len(audio) > 100:
+                return audio
+            logger.warning(f"Edge TTS juda kichik audio qaytardi ({len(audio)} bayt)")
+            return None
+        except Exception as e:
+            logger.warning(f"Edge TTS xatosi (urinish {attempt + 1}/{retries + 1}): {e}")
+            if attempt < retries:
+                await asyncio.sleep(1.0 * (attempt + 1))
+    return None
+
+
+async def mp3_to_ogg(mp3_bytes: bytes) -> bytes | None:
+    """MP3 faylni OGG (Opus) ga o'giradi — Telegram voice xabari uchun.
+
+    FFmpeg asyncio.create_subprocess_exec orqali chaqiriladi (bloklamaydi).
+    """
+    uid = uuid.uuid4().hex[:12]
+    in_path = TMP_DIR / f"conv_in_{uid}.mp3"
+    out_path = TMP_DIR / f"conv_out_{uid}.ogg"
+
+    try:
+        in_path.write_bytes(mp3_bytes)
+        cmd = [
+            FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(in_path),
+            "-c:a", "libopus",
+            "-b:a", "48k",
+            "-ar", "16000",
+            "-ac", "1",
+            str(out_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            logger.error(f"MP3->OGG FFmpeg xatosi: {stderr.decode(errors='replace')[:300]}")
+            return None
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            return None
+        return out_path.read_bytes()
+    except Exception as e:
+        logger.error(f"MP3->OGG konversiya xatosi: {e}")
+        return None
+    finally:
+        for p in (in_path, out_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+
+def get_edge_voice(lang: str, gender: str) -> str:
+    """Til va jinsga qarab Edge TTS ovozini tanlaydi."""
+    voices = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["uz"])
+    return voices.get(gender, voices.get("male", "uz-UZ-SardorNeural"))
 
 
 async def gtts_speak(text: str, lang: str = "en") -> bytes | None:
@@ -418,46 +651,47 @@ async def synthesize_speech(
     text: str,
     lang: str = "uz",
     voice_id: str | None = None,
-    prefer_fish: bool = False,
+    gender: str = "male",
+    speed: str = "normal",
 ) -> tuple[bytes | None, str]:
     """
     Matnni ovozga aylantiradi.
-    - Kokoro TTS birinchi (asosiy dvigatel, barcha tillar uchun)
-    - Fish Audio ikkinchi (Kokoro ishlamayotganda fallback)
-    - gTTS uchinchi (Kokoro va Fish Audio ishlamayotganda)
+    - Edge TTS birinchi (asosiy dvigatel — bepul, tez, o'zbekcha)
+    - Kokoro TTS ikkinchi (Edge ishlamayotganda)
+    - Fish Audio uchinchi
+    - gTTS oxirgi (faqat qo'llab-quvvatlanadigan tillar)
     Qaytadi: (audio_bytes | None, qaysi dvigatel ishlatildi)
     """
     text = (text or "").strip()
     if not text:
         return None, ""
 
-    kokoro_ok = KOKORO_ENABLED
-    fish_ok = bool(OPENROUTER_API_KEY)
-    gtts_ok = lang in GTTS_LANGS
+    # 1) Edge TTS — asosiy (har doim birinchi)
+    edge_voice = get_edge_voice(lang, gender)
+    edge_rate = EDGE_TTS_RATES.get(speed, "+0%")
+    audio = await edge_tts_speak(text, edge_voice, rate=edge_rate)
+    if audio:
+        return audio, "Edge TTS"
 
-    # Kokoro har doim birinchi (barcha tillar uchun ishlaydi)
-    order = []
-    if kokoro_ok:
-        order.append("kokoro")
-    if fish_ok:
-        order.append("fish")
-    if gtts_ok:
-        order.append("gtts")
-
-    for engine in order:
-        if engine == "kokoro":
-            audio = await kokoro_tts(text, voice_id)
-            label = "Kokoro TTS"
-        elif engine == "fish":
-            audio = await fish_audio_tts(text, voice_id)
-            label = "Fish Audio"
-        else:
-            audio = await gtts_speak(text, lang)
-            label = "gTTS"
+    # 2) Kokoro TTS
+    if KOKORO_ENABLED:
+        audio = await kokoro_tts(text, voice_id)
         if audio:
-            return audio, label
+            return audio, "Kokoro TTS"
 
-    logger.error(f"Ovoz yaratib bo'lmadi (lang={lang}, engine={order})")
+    # 3) Fish Audio
+    if OPENROUTER_API_KEY:
+        audio = await fish_audio_tts(text, voice_id)
+        if audio:
+            return audio, "Fish Audio"
+
+    # 4) gTTS (oxirgi fallback)
+    if lang in GTTS_LANGS:
+        audio = await gtts_speak(text, lang)
+        if audio:
+            return audio, "gTTS"
+
+    logger.error(f"Ovoz yaratib bo'lmadi (lang={lang})")
     return None, ""
 
 
@@ -1022,29 +1256,66 @@ async def do_tts(message: Message, processing: Message, text: str, intent: dict)
     lang = intent.get("lang") or "uz"
     hint = intent.get("voice") or "default"
 
+    # Foydalanuvchi sozlamalarini olamiz
+    uid = message.from_user.id
+    settings = await db.get_settings(uid)
+    gender = settings["voice_gender"]
+    speed = settings["speed"]
+
+    # Agar foydalanuvchi ma'lum til/ovoz so'ragan bo'lsa — o'shani ishlatamiz
+    if lang not in EDGE_TTS_VOICES:
+        lang = settings["language"]
+
     if not speak:
-        await safe_edit(processing, "⚠️ Ovozga aylantirish uchun matn topilmadi.")
+        await safe_edit(processing, T.ERR_EMPTY_TEXT)
         return
-    if len(speak) > 4000:
-        speak = speak[:4000]
+    if len(speak) > MAX_TEXT_CHARS:
+        speak = speak[:MAX_TEXT_CHARS]
 
-    await safe_edit(processing, "⏳ Ovoz yaratilmoqda...")
-    await typing(message)
+    await safe_edit(processing, T.STATUS_TTS)
+    await record_voice(message)
 
-    audio, engine = await synthesize_speech(
-        speak, lang=lang, voice_id=voice_for_hint(hint),
-        prefer_fish=(hint != "default"),
-    )
-
-    if not audio:
-        await safe_edit(processing, "❌ Ovoz yaratib bo'lmadi. Birozdan so'ng qayta urinib ko'ring.")
+    # Matnni bo'laklarga bo'lamiz
+    chunks = chunk_text(speak)
+    if not chunks:
+        await safe_edit(processing, T.ERR_EMPTY_TEXT)
         return
 
-    await message.answer_voice(
-        voice=BufferedInputFile(audio, filename="voice.mp3"),
-        caption=f"🔊 {engine} • {lang.upper()} • {len(speak)} belgi",
-    )
+    sent = 0
+    for idx, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            await safe_edit(processing, T.STATUS_CHUNK.format(current=idx, total=len(chunks)))
+            await record_voice(message)
+
+        async with TTS_SEMAPHORE:
+            audio, engine = await synthesize_speech(
+                chunk, lang=lang, voice_id=voice_for_hint(hint),
+                gender=gender, speed=speed,
+            )
+
+        if not audio:
+            logger.error(f"Bo'lak {idx}/{len(chunks)} uchun ovoz yaratib bo'lmadi")
+            continue
+
+        # MP3 -> OGG (Opus) konversiya (Telegram voice uchun)
+        ogg = await mp3_to_ogg(audio)
+        if ogg:
+            voice_file = BufferedInputFile(ogg, filename="voice.ogg")
+        else:
+            # Konversiya ishlamasa — MP3 sifatida yuboramiz
+            voice_file = BufferedInputFile(audio, filename="voice.mp3")
+
+        caption = T.TTS_DONE.format(engine=engine, lang=lang.upper(), chars=len(chunk))
+        if len(chunks) > 1:
+            caption += f" ({idx}/{len(chunks)})"
+
+        await message.answer_voice(voice=voice_file, caption=caption)
+        sent += 1
+
     await kill(processing)
+
+    if sent == 0:
+        await message.answer(T.ERR_NO_VOICE)
 
 
 async def do_grandpa(message: Message, processing: Message, text: str, intent: dict) -> None:
@@ -1053,32 +1324,49 @@ async def do_grandpa(message: Message, processing: Message, text: str, intent: d
     lang = intent.get("lang") or "uz"
     hint = intent.get("voice") or "default"
 
+    # Foydalanuvchi sozlamalarini olamiz
+    uid = message.from_user.id
+    settings = await db.get_settings(uid)
+    gender = settings["voice_gender"]
+    speed = settings["speed"]
+
+    if lang not in EDGE_TTS_VOICES:
+        lang = settings["language"]
+
     if not speak:
-        await safe_edit(processing, "⚠️ Grandpa effekti uchun matn topilmadi.")
+        await safe_edit(processing, T.ERR_EMPTY_TEXT)
         return
     if len(speak) > 3000:
         speak = speak[:3000]
 
-    await safe_edit(processing, "⏳ Ovoz yaratilmoqda...")
-    await typing(message)
+    await safe_edit(processing, T.STATUS_TTS)
+    await record_voice(message)
 
-    audio, _engine = await synthesize_speech(
-        speak, lang=lang, voice_id=voice_for_hint(hint),
-        prefer_fish=(hint != "default"),
-    )
+    async with TTS_SEMAPHORE:
+        audio, _engine = await synthesize_speech(
+            speak, lang=lang, voice_id=voice_for_hint(hint),
+            gender=gender, speed=speed,
+        )
     if not audio:
-        await safe_edit(processing, "❌ Ovoz yaratib bo'lmadi. Qayta urinib ko'ring.")
+        await safe_edit(processing, T.ERR_NO_VOICE)
         return
 
-    await safe_edit(processing, "👴 Grandpa effekti qo'llanmoqda...")
+    await safe_edit(processing, T.STATUS_GRANDPA)
     processed = await apply_grandpa_effect(audio)
     if processed is None:
         logger.warning("Grandpa effekti ishlamadi, oddiy ovoz yuboriladi")
         processed = audio
 
+    # MP3 -> OGG konversiya
+    ogg = await mp3_to_ogg(processed)
+    if ogg:
+        voice_file = BufferedInputFile(ogg, filename="grandpa.ogg")
+    else:
+        voice_file = BufferedInputFile(processed, filename="grandpa_voice.mp3")
+
     await message.answer_voice(
-        voice=BufferedInputFile(processed, filename="grandpa_voice.mp3"),
-        caption=f"👴 Grandpa effekti • {len(speak)} belgi",
+        voice=voice_file,
+        caption=T.GRANDPA_DONE.format(chars=len(speak)),
     )
     await kill(processing)
 
@@ -1169,14 +1457,27 @@ async def run_pipeline(message: Message, user_text: str, processing: Message) ->
     """Asosiy AI oqimi: niyat aniqlash -> amal bajarish."""
     text = (user_text or "").strip()
     if not text:
-        await safe_edit(processing, "⚠️ Matn topilmadi. Iltimos, qayta yozing.")
+        await safe_edit(processing, T.ERR_EMPTY_TEXT)
+        return
+
+    uid = message.from_user.id
+
+    # Kunlik limitni tekshiramiz
+    if not await db.check_daily_limit(uid, DAILY_LIMIT):
+        await safe_edit(processing, T.ERR_DAILY_LIMIT.format(limit=DAILY_LIMIT))
         return
 
     try:
         await typing(message)
-        history = get_history(message.from_user.id)
+        history = get_history(uid)
         intent = await detect_intent(text, history)
         kind = intent["intent"]
+
+        # Matnni tarixga saqlaymiz
+        await db.add_history(uid, text)
+
+        # So'rovlar hisobini oshiramiz
+        await db.increment_usage(uid)
 
         if kind == "tts":
             await do_tts(message, processing, text, intent)
@@ -1189,7 +1490,42 @@ async def run_pipeline(message: Message, user_text: str, processing: Message) ->
 
     except Exception as e:
         logger.error(f"Oqim xatosi: {e}", exc_info=True)
-        await safe_edit(processing, f"❌ Kutilmagan xatolik: {str(e)[:200]}")
+        await safe_edit(processing, T.ERR_UNKNOWN.format(error=str(e)[:200]))
+
+
+# =============================================
+# MIDDLEWARE (throttling) va SEMAPHORE
+# =============================================
+
+# TTS parallelligini cheklash (bir vaqtda ko'p so'rov botni qotirmasin)
+TTS_SEMAPHORE = asyncio.Semaphore(5)
+
+# Throttling: bir foydalanuvchi 1.5 soniyada ko'p so'rov yubormasin
+_last_request: dict[int, float] = {}
+THROTTLE_SECONDS = 1.5
+
+
+async def throttling_middleware(handler, event, data: dict):
+    """Foydalanuvchi so'rovlar tezligini cheklaydi (anti-spam)."""
+    user = event.from_user
+    if user is None:
+        return await handler(event, data)
+
+    now = asyncio.get_event_loop().time()
+    last = _last_request.get(user.id, 0)
+    if now - last < THROTTLE_SECONDS:
+        # Juda tez — e'tiborsiz qoldiramiz
+        logger.debug(f"Throttled: user {user.id}")
+        return
+    _last_request[user.id] = now
+
+    # Keshni tozalash (eski yozuvlar)
+    if len(_last_request) > 10000:
+        cutoff = now - 300
+        for uid in [k for k, v in _last_request.items() if v < cutoff]:
+            del _last_request[uid]
+
+    return await handler(event, data)
 
 
 # =============================================
@@ -1197,6 +1533,9 @@ async def run_pipeline(message: Message, user_text: str, processing: Message) ->
 # =============================================
 
 dp = Dispatcher(storage=MemoryStorage())
+dp.message.middleware(throttling_middleware)
+dp.callback_query.middleware(throttling_middleware)
+dp.inline_query.middleware(throttling_middleware)
 
 
 @dp.message(CommandStart())
@@ -1207,6 +1546,9 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(Flow.ai_chat)
     await typing(message)
 
+    # Foydalanuvchini bazaga qo'shamiz
+    await db.get_settings(uid)
+
     greeting = None
     if GEMINI_API_KEY:
         greeting = await gemini_chat(
@@ -1214,29 +1556,29 @@ async def cmd_start(message: Message, state: FSMContext):
             GREETING_SYSTEM,
         )
     if greeting:
-        # AI matni oddiy matn sifatida yuboriladi (HTML/markdown belgilar uchun xavfsiz)
         await message.answer(clip(clean_ai_text(greeting), 3900))
     else:
-        await message.answer(clip(DEFAULT_GREETING, 3900), parse_mode=ParseMode.HTML)
+        await message.answer(clip(T.GREETING, 3900), parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(
-        "ℹ️ <b>Yo'riqnoma</b>\n\n"
-        "Men AI yordamchiman — oddiygina yozing yoki ovoz yuboring:\n\n"
-        "🔊 <b>Matn → Ovoz</b> — 'Salom, bugun ob-havo zo'r' deb yozing\n"
-        "🎤 <b>Ovoz → Matn</b> — mikrofon tugmasini bosib gapiring\n"
-        "👴 <b>Grandpa effekti</b> — 'Grandpa ovozida aylantir: ...'\n"
-        "🎭 <b>Senariy</b> — qahramonlari bilan dialog yuboring, "
-        "har biriga alohida ovoz beraman\n"
-        "💬 <b>Suhbat</b> — har qanday savol bering\n\n"
-        "Buyruqlar:\n"
-        "/start — qaytadan boshlash\n"
-        "/reset — suhbat tarixini tozalash\n\n"
-        "⚠️ Maksimal ovoz xabari: 5 daqiqa",
-        parse_mode=ParseMode.HTML,
-    )
+    await message.answer(T.HELP, parse_mode=ParseMode.HTML)
+
+
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    """/history — foydalanuvchining oxirgi matnlari."""
+    uid = message.from_user.id
+    history = await db.get_history(uid, limit=10)
+    if not history:
+        await message.answer(T.HISTORY_EMPTY)
+        return
+
+    lines = [T.HISTORY_HEADER.format(count=len(history))]
+    for i, text in enumerate(reversed(history), start=1):
+        lines.append(f"{i}. {clip(text, 100)}")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @dp.message(Command("reset"))
@@ -1244,9 +1586,126 @@ async def cmd_reset(message: Message, state: FSMContext):
     uid = message.from_user.id
     user_data[uid] = {"history": []}
     await state.set_state(Flow.ai_chat)
-    await message.answer(
-        "🔄 Suhbat tarixi tozalandi. Qaytadan boshlaymiz — yozing yoki ovoz yuboring! 😊"
+    await message.answer(T.RESET_DONE)
+
+
+# =============================================
+# /settings — sozlamalar (inline tugmalar)
+# =============================================
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    """Sozlamalar uchun inline tugmalar klaviaturasi."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.CHOOSE_LANG, callback_data="settings:lang")],
+        [InlineKeyboardButton(text=T.CHOOSE_VOICE, callback_data="settings:voice")],
+        [InlineKeyboardButton(text=T.CHOOSE_SPEED, callback_data="settings:speed")],
+        [InlineKeyboardButton(text=T.BTN_REFRESH, callback_data="settings:refresh")],
+    ])
+
+
+def build_lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.BTN_LANG_UZ, callback_data="lang:uz")],
+        [InlineKeyboardButton(text=T.BTN_LANG_RU, callback_data="lang:ru")],
+        [InlineKeyboardButton(text=T.BTN_LANG_EN, callback_data="lang:en")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+    ])
+
+
+def build_voice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.BTN_VOICE_MALE, callback_data="voice:male")],
+        [InlineKeyboardButton(text=T.BTN_VOICE_FEMALE, callback_data="voice:female")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+    ])
+
+
+def build_speed_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.BTN_SPEED_SLOW, callback_data="speed:slow")],
+        [InlineKeyboardButton(text=T.BTN_SPEED_NORMAL, callback_data="speed:normal")],
+        [InlineKeyboardButton(text=T.BTN_SPEED_FAST, callback_data="speed:fast")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+    ])
+
+
+async def settings_summary(user_id: int) -> str:
+    """Foydalanuvchining hozirgi sozlamalari haqida matn qaytaradi."""
+    s = await db.get_settings(user_id)
+    return T.SETTINGS_HEADER + "\n\n" + T.SETTINGS_SUMMARY.format(
+        lang=LANG_LABELS.get(s["language"], s["language"]),
+        voice=GENDER_LABELS_UI.get(s["voice_gender"], s["voice_gender"]),
+        speed=SPEED_LABELS.get(s["speed"], s["speed"]),
     )
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    """/settings — sozlamalarni ko'rsatish."""
+    text = await settings_summary(message.from_user.id)
+    await message.answer(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query(F.data.startswith("settings:"))
+async def settings_callback(callback: CallbackQuery):
+    """Sozlamalar tugmalari boshqaruvi."""
+    uid = callback.from_user.id
+    action = callback.data.split(":", 1)[1]
+
+    if action == "lang":
+        text = await settings_summary(uid) + "\n\n" + T.CHOOSE_LANG
+        await callback.message.edit_text(text, reply_markup=build_lang_keyboard(), parse_mode=ParseMode.HTML)
+    elif action == "voice":
+        text = await settings_summary(uid) + "\n\n" + T.CHOOSE_VOICE
+        await callback.message.edit_text(text, reply_markup=build_voice_keyboard(), parse_mode=ParseMode.HTML)
+    elif action == "speed":
+        text = await settings_summary(uid) + "\n\n" + T.CHOOSE_SPEED
+        await callback.message.edit_text(text, reply_markup=build_speed_keyboard(), parse_mode=ParseMode.HTML)
+    elif action == "refresh":
+        text = await settings_summary(uid)
+        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def lang_callback(callback: CallbackQuery):
+    """Til tanlash."""
+    uid = callback.from_user.id
+    lang = callback.data.split(":", 1)[1]
+    if lang in db.VALID_LANGUAGES:
+        await db.update_settings(uid, language=lang)
+        text = T.SETTINGS_LANG_SET.format(lang=LANG_LABELS.get(lang, lang)) + "\n\n"
+        text += await settings_summary(uid)
+        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("voice:"))
+async def voice_callback(callback: CallbackQuery):
+    """Ovoz tanlash (erkak/ayol)."""
+    uid = callback.from_user.id
+    gender = callback.data.split(":", 1)[1]
+    if gender in db.VALID_GENDERS:
+        await db.update_settings(uid, voice_gender=gender)
+        text = T.SETTINGS_VOICE_SET.format(voice=GENDER_LABELS_UI.get(gender, gender)) + "\n\n"
+        text += await settings_summary(uid)
+        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("speed:"))
+async def speed_callback(callback: CallbackQuery):
+    """Tezlik tanlash."""
+    uid = callback.from_user.id
+    speed = callback.data.split(":", 1)[1]
+    if speed in db.VALID_SPEEDS:
+        await db.update_settings(uid, speed=speed)
+        text = T.SETTINGS_SPEED_SET.format(speed=SPEED_LABELS.get(speed, speed)) + "\n\n"
+        text += await settings_summary(uid)
+        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.answer()
 
 
 @dp.message(F.voice | F.audio)
@@ -1258,11 +1717,11 @@ async def voice_message_handler(message: Message, state: FSMContext):
     duration = tg_file.duration or 0
     if duration > MAX_VOICE_SECONDS:
         await message.answer(
-            f"⚠️ Ovoz juda uzun ({duration} s). Maksimal {MAX_VOICE_SECONDS} soniya."
+            T.ERR_VOICE_TOO_LONG.format(duration=duration, max=MAX_VOICE_SECONDS)
         )
         return
 
-    processing = await message.answer("🎤 Ovoz tinglanmoqda...")
+    processing = await message.answer(T.STATUS_VOICE_HEARING)
     tmp_path = TMP_DIR / f"stt_{uuid.uuid4().hex[:12]}.ogg"
 
     try:
@@ -1271,7 +1730,7 @@ async def voice_message_handler(message: Message, state: FSMContext):
         audio_bytes = tmp_path.read_bytes()
         mime_type = "audio/ogg" if message.voice else "audio/mpeg"
 
-        await safe_edit(processing, "⏳ Matnga aylantirilmoqda...")
+        await safe_edit(processing, T.STATUS_TRANSCRIBING)
         transcript = await gemini_stt(audio_bytes, mime_type)
 
         if not transcript:
@@ -1292,9 +1751,118 @@ async def voice_message_handler(message: Message, state: FSMContext):
         except OSError:
             pass
 
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    await safe_edit(processing, f"🗣️ «{clip(cleaned, 500)}»\n\n🧠 Davom etilmoqda...")
+    await typing(message)
+    await safe_edit(processing, T.TRANSCRIPT.format(text=clip(cleaned, 500)))
     await run_pipeline(message, cleaned, processing)
+
+
+# =============================================
+# FAYL O'QISH (.txt / .pdf / .docx)
+# =============================================
+
+SUPPORTED_EXTS = {".txt", ".pdf", ".docx"}
+
+
+def extract_document_text(path: Path, ext: str) -> str | None:
+    """Fayldan matnni o'qiydi (.txt, .pdf, .docx). Xatolikda None qaytaradi."""
+    try:
+        if ext == ".txt":
+            raw = path.read_bytes()
+            # Kodlashni avtomatik aniqlaymiz (o'zbek matn ko'pincha UTF-8)
+            for enc in ("utf-8", "utf-8-sig", "cp1251", "latin-1"):
+                try:
+                    return raw.decode(enc)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return None
+
+        if ext == ".pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            parts: list[str] = []
+            for page in reader.pages[:100]:  # 100 sahifagacha
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    continue
+                if t.strip():
+                    parts.append(t.strip())
+            return "\n\n".join(parts)
+
+        if ext == ".docx":
+            from docx import Document
+            doc = Document(str(path))
+            parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            # Jadval matnlarini ham olamiz
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n".join(parts)
+
+    except Exception as e:
+        logger.error(f"Fayl o'qish xatosi ({ext}): {e}")
+        return None
+    return None
+
+
+@dp.message(F.document)
+async def document_handler(message: Message, state: FSMContext):
+    """Fayl o'qish: .txt, .pdf, .docx -> matnga aylantirib AI oqimiga beradi."""
+    await state.set_state(Flow.ai_chat)
+
+    doc = message.document
+    if doc is None:
+        return
+
+    name = (doc.file_name or "").lower()
+    ext = Path(name).suffix
+
+    if ext not in SUPPORTED_EXTS:
+        await message.answer(T.ERR_FILE_TYPE, parse_mode=ParseMode.HTML)
+        return
+
+    size_mb = (doc.file_size or 0) / (1024 * 1024)
+    if size_mb > FILE_SIZE_LIMIT_MB:
+        await message.answer(
+            T.ERR_FILE_TOO_BIG.format(size=round(size_mb, 1), max=FILE_SIZE_LIMIT_MB)
+        )
+        return
+
+    processing = await message.answer(T.STATUS_FILE_READING)
+    tmp_path = TMP_DIR / f"doc_{uuid.uuid4().hex[:12]}{ext}"
+
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        await message.bot.download_file(file.file_path, destination=str(tmp_path))
+
+        text = await asyncio.to_thread(extract_document_text, tmp_path, ext)
+        if not text or not text.strip():
+            await safe_edit(processing, T.ERR_FILE_READ)
+            return
+
+        text = text.strip()
+        # Fayldan o'qilgan matnni cheklab, oqimga beramiz
+        if len(text) > MAX_TEXT_CHARS:
+            text = text[:MAX_TEXT_CHARS]
+
+        await safe_edit(
+            processing,
+            f"📄 <b>{doc.file_name}</b>\n{len(text)} belgi o'qildi. Davom etilmoqda...",
+        )
+        await run_pipeline(message, text, processing)
+
+    except Exception as e:
+        logger.error(f"Fayl handler xatosi: {e}", exc_info=True)
+        await safe_edit(processing, T.ERR_FILE_READ)
+
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 @dp.message(F.text)
@@ -1313,11 +1881,177 @@ async def text_message_handler(message: Message, state: FSMContext):
 @dp.message()
 async def other_content_handler(message: Message):
     """Boshqa kontent turlari (stiker, rasm, hujjat...)."""
-    await message.answer(
-        "😊 Men hozircha <b>matn</b> va <b>ovozli xabar</b>lar bilan ishlayman.\n"
-        "Matn yozing yoki mikrofon tugmasini bosib ovoz yuboring!",
-        parse_mode=ParseMode.HTML,
+    await message.answer(T.NOT_UNDERSTOOD, parse_mode=ParseMode.HTML)
+
+
+# =============================================
+# INLINE REJIM (@bot matn — istalgan chatda ovoz)
+# =============================================
+
+
+def detect_lang_fast(text: str) -> str:
+    """Tez til aniqlash (inline rejim uchun, API'siz)."""
+    if re.search(r"[а-яёА-ЯЁ]", text):
+        return "ru"
+    if (
+        re.search(r"[oO]'|[gG]'|[ʻʼ]", text)
+        or re.search(
+            r"\b(men|siz|biz|bu|va|uchun|ham|lekin|assalomu|salom|qanday|nima)\b",
+            text, re.IGNORECASE,
+        )
+    ):
+        return "uz"
+    if re.search(
+        r"\b(the|is|are|and|you|hello|this|that|for|with|what|how)\b",
+        text, re.IGNORECASE,
+    ):
+        return "en"
+    return "uz"
+
+
+async def publish_audio(audio: bytes) -> str | None:
+    """Audio faylni bepul hostga yuklab, to'g'ridan-to'g'ri URL qaytaradi.
+
+    Inline rejimda Telegram ovoz uchun tashqi URL talab qiladi.
+    1) catbox.moe (doimiy) — 2) uguu.se (1 soat) fallback.
+    """
+    filename = f"voice_{uuid.uuid4().hex[:8]}.mp3"
+    timeout = aiohttp.ClientTimeout(total=40)
+
+    # 1) catbox.moe
+    try:
+        form = aiohttp.FormData()
+        form.add_field("reqtype", "fileupload")
+        form.add_field("fileToUpload", audio, filename=filename, content_type="audio/mpeg")
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post("https://catbox.moe/user/api.php", data=form) as resp:
+                if resp.status == 200:
+                    url = (await resp.text()).strip()
+                    if url.startswith("http"):
+                        return url
+    except Exception as e:
+        logger.warning(f"catbox.moe yuklash xatosi: {e}")
+
+    # 2) uguu.se (1 soat)
+    try:
+        form = aiohttp.FormData()
+        form.add_field("reqtype", "fileupload")
+        form.add_field("files[]", audio, filename=filename, content_type="audio/mpeg")
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post("https://uguu.se/upload.php", data=form) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") and data.get("files"):
+                        return data["files"][0].get("url")
+    except Exception as e:
+        logger.warning(f"uguu.se yuklash xatosi: {e}")
+
+    return None
+
+
+def _inline_article(title: str, description: str, text: str) -> InlineQueryResultArticle:
+    """Oddiy matn maqolasini qaytaradi (xatolik/holat uchun)."""
+    return InlineQueryResultArticle(
+        id=uuid.uuid4().hex,
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(message_text=text),
     )
+
+
+@dp.inline_query()
+async def inline_handler(inline_query: InlineQuery):
+    """Inline rejimi: har qanday chatda '@bot matn' — ovoz xabari paydo bo'ladi."""
+    uid = inline_query.from_user.id
+    text = (inline_query.query or "").strip()
+
+    # Bo'sh so'rov — yordam ko'rsatamiz
+    if not text:
+        await inline_query.answer(
+            results=[
+                _inline_article(
+                    "🔊 Ovozga aylantirish",
+                    "Matn yozing — ovoz yaratib beraman",
+                    "Misol: @mp3speak_bot Salom dunyo",
+                )
+            ],
+            cache_time=1,
+            is_personal=True,
+        )
+        return
+
+    # Inline so'rov uzunligi cheklangan (256 belgi)
+    text = text[:256]
+
+    # Kunlik limitni tekshiramiz
+    if not await db.check_daily_limit(uid, DAILY_LIMIT):
+        await inline_query.answer(
+            results=[
+                _inline_article(
+                    "🚫 Limit tugadi",
+                    "Bugungi limit tugadi",
+                    T.ERR_DAILY_LIMIT.format(limit=DAILY_LIMIT),
+                )
+            ],
+            cache_time=60,
+            is_personal=True,
+        )
+        return
+
+    # Foydalanuvchi sozlamalari + tez til aniqlash
+    settings = await db.get_settings(uid)
+    lang = detect_lang_fast(text)
+    voice = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["uz"]).get(
+        settings["voice_gender"], "uz-UZ-SardorNeural"
+    )
+    rate = EDGE_TTS_RATES.get(settings["speed"], "+0%")
+
+    # Ovoz yaratamiz (Edge TTS — tez, ~0.5-1s)
+    async with TTS_SEMAPHORE:
+        audio = await edge_tts_speak(text, voice, rate=rate)
+
+    if not audio:
+        await inline_query.answer(
+            results=[
+                _inline_article(
+                    "❌ Xatolik",
+                    "Ovoz yaratib bo'lmadi",
+                    T.ERR_NO_VOICE,
+                )
+            ],
+            cache_time=60,
+            is_personal=True,
+        )
+        return
+
+    # URL olish uchun yuklaymiz
+    url = await publish_audio(audio)
+    if not url:
+        await inline_query.answer(
+            results=[
+                _inline_article(
+                    "❌ Xatolik",
+                    "Audio host ishlamayapti",
+                    T.ERR_NO_VOICE,
+                )
+            ],
+            cache_time=60,
+            is_personal=True,
+        )
+        return
+
+    result = InlineQueryResultVoice(
+        id=uuid.uuid4().hex,
+        voice=url,
+        caption=T.TTS_DONE.format(engine="Edge TTS", lang=lang.upper(), chars=len(text)),
+    )
+    await inline_query.answer(
+        results=[result], cache_time=3600, is_personal=True
+    )
+
+    # Hisobni yuritamiz
+    await db.add_history(uid, text)
+    await db.increment_usage(uid)
 
 
 # =============================================
@@ -1336,7 +2070,10 @@ async def main():
     if not OPENROUTER_THINKING_KEY:
         logger.warning("OPENROUTER_THINKING_KEY topilmadi — matnni tayyorlash o'tkaziladi.")
     if not GTTS_AVAILABLE:
-        logger.warning("gTTS o'rnatilmagan — TTS faqat Fish Audio orqali ishlaydi.")
+        logger.warning("gTTS o'rnatilmagan — TTS faqat Edge/Kokoro/Fish Audio orqali ishlaydi.")
+
+    # Bazani ishga tushiramiz
+    await db.init_db()
 
     bot = Bot(token=BOT_TOKEN)
     logger.info("AI Ovoz Bot ishga tushdi!")
