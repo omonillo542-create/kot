@@ -96,41 +96,48 @@ async def get_settings(user_id: int) -> dict:
 
 
 async def update_settings(user_id: int, **kwargs) -> None:
-    """Foydalanuvchi sozlamalarini yangilaydi (yoki yangi qator qo'shadi)."""
-    lang = kwargs.get("language", DEFAULT_SETTINGS["language"])
-    gender = kwargs.get("voice_gender", DEFAULT_SETTINGS["voice_gender"])
-    speed = kwargs.get("speed", DEFAULT_SETTINGS["speed"])
-    voice_id = kwargs.get("voice_id", None)
+    """Foydalanuvchi sozlamalarini yangilaydi.
 
-    # Validatsiya
-    if lang not in VALID_LANGUAGES:
-        lang = "uz"
-    if gender not in VALID_GENDERS:
-        gender = "male"
-    if speed not in VALID_SPEEDS:
-        speed = "normal"
+    FAQAT berilgan maydonlar o'zgartiriladi — qolganlari saqlanib qoladi.
+    Masalan: update_settings(uid, voice_id="x") — til/jins/tezlik tegilmaydi.
+    """
+    fields: dict = {}
+
+    if "language" in kwargs:
+        lang = kwargs["language"]
+        if lang not in VALID_LANGUAGES:
+            lang = "uz"
+        fields["language"] = lang
+
+    if "voice_gender" in kwargs:
+        gender = kwargs["voice_gender"]
+        if gender not in VALID_GENDERS:
+            gender = "male"
+        fields["voice_gender"] = gender
+
+    if "speed" in kwargs:
+        speed = kwargs["speed"]
+        if speed not in VALID_SPEEDS:
+            speed = "normal"
+        fields["speed"] = speed
+
+    if "voice_id" in kwargs:
+        fields["voice_id"] = kwargs["voice_id"] or ""
+
+    if not fields:
+        return
+
+    cols = list(fields.keys())
+    placeholders = ", ".join("?" for _ in cols)
+    assignments = ", ".join(f"{c} = excluded.{c}" for c in cols)
+    sql = (
+        f"INSERT INTO users (user_id, {', '.join(cols)}) "
+        f"VALUES (?, {placeholders}) "
+        f"ON CONFLICT(user_id) DO UPDATE SET {assignments}"
+    )
 
     async with aiosqlite.connect(DB_PATH) as db:
-        if voice_id is None:
-            # voice_id ni tegilma — mavjud qiymat saqlanadi
-            await db.execute("""
-                INSERT INTO users (user_id, language, voice_gender, speed)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    language = excluded.language,
-                    voice_gender = excluded.voice_gender,
-                    speed = excluded.speed
-            """, (user_id, lang, gender, speed))
-        else:
-            await db.execute("""
-                INSERT INTO users (user_id, language, voice_gender, speed, voice_id)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    language = excluded.language,
-                    voice_gender = excluded.voice_gender,
-                    speed = excluded.speed,
-                    voice_id = excluded.voice_id
-            """, (user_id, lang, gender, speed, voice_id or ""))
+        await db.execute(sql, (user_id, *fields.values()))
         await db.commit()
 
 
