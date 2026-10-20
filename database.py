@@ -25,6 +25,7 @@ DEFAULT_SETTINGS = {
     "language": "uz",
     "voice_gender": "male",
     "speed": "normal",
+    "voice_id": "",
 }
 
 
@@ -37,9 +38,12 @@ async def init_db() -> None:
                 language TEXT DEFAULT 'uz',
                 voice_gender TEXT DEFAULT 'male',
                 speed TEXT DEFAULT 'normal',
+                voice_id TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migratsiya: eski bazalarda voice_id ustuni yo'q
+        await _ensure_column(db, "users", "voice_id", "TEXT DEFAULT ''")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,12 +64,22 @@ async def init_db() -> None:
         logger.info("Baza tayyor: %s", DB_PATH)
 
 
+async def _ensure_column(db, table: str, column: str, ddl: str) -> None:
+    """Ustun mavjud bo'lmasa — qo'shib qo'yadi (migratsiya)."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    existing = {r[1] for r in rows}
+    if column not in existing:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        logger.info("Migratsiya: %s.%s qo'shildi", table, column)
+
+
 async def get_settings(user_id: int) -> dict:
     """Foydalanuvchi sozlamalarini oladi. Mavjud bo'lmasa — default."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT language, voice_gender, speed FROM users WHERE user_id = ?",
+            "SELECT language, voice_gender, speed, voice_id FROM users WHERE user_id = ?",
             (user_id,)
         ) as cur:
             row = await cur.fetchone()
@@ -74,6 +88,7 @@ async def get_settings(user_id: int) -> dict:
                     "language": row["language"],
                     "voice_gender": row["voice_gender"],
                     "speed": row["speed"],
+                    "voice_id": row["voice_id"] or "",
                 }
     # Foydalanuvchi bazada yo'q — yaratamiz
     await update_settings(user_id, **DEFAULT_SETTINGS)
@@ -85,6 +100,7 @@ async def update_settings(user_id: int, **kwargs) -> None:
     lang = kwargs.get("language", DEFAULT_SETTINGS["language"])
     gender = kwargs.get("voice_gender", DEFAULT_SETTINGS["voice_gender"])
     speed = kwargs.get("speed", DEFAULT_SETTINGS["speed"])
+    voice_id = kwargs.get("voice_id", None)
 
     # Validatsiya
     if lang not in VALID_LANGUAGES:
@@ -95,14 +111,26 @@ async def update_settings(user_id: int, **kwargs) -> None:
         speed = "normal"
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO users (user_id, language, voice_gender, speed)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                language = excluded.language,
-                voice_gender = excluded.voice_gender,
-                speed = excluded.speed
-        """, (user_id, lang, gender, speed))
+        if voice_id is None:
+            # voice_id ni tegilma — mavjud qiymat saqlanadi
+            await db.execute("""
+                INSERT INTO users (user_id, language, voice_gender, speed)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    language = excluded.language,
+                    voice_gender = excluded.voice_gender,
+                    speed = excluded.speed
+            """, (user_id, lang, gender, speed))
+        else:
+            await db.execute("""
+                INSERT INTO users (user_id, language, voice_gender, speed, voice_id)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    language = excluded.language,
+                    voice_gender = excluded.voice_gender,
+                    speed = excluded.speed,
+                    voice_id = excluded.voice_id
+            """, (user_id, lang, gender, speed, voice_id or ""))
         await db.commit()
 
 
@@ -197,3 +225,40 @@ async def get_all_user_ids() -> list[int]:
         async with db.execute("SELECT user_id FROM users") as cur:
             rows = await cur.fetchall()
             return [r[0] for r in rows]
+
+
+async def get_user_usage(user_id: int) -> tuple[int, int]:
+    """Foydalanuvchining (bugungi, jami) so'rovlar sonini qaytaradi."""
+    import datetime
+    today = datetime.date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT count FROM daily_usage WHERE user_id = ? AND date = ?",
+            (user_id, today),
+        ) as cur:
+            row = await cur.fetchone()
+            today_count = row[0] if row else 0
+        async with db.execute(
+            "SELECT SUM(count) FROM daily_usage WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            total_count = row[0] if row and row[0] else 0
+    return today_count, total_count
+
+
+async def get_user_history_count(user_id: int) -> int:
+    """Foydalanuvchi tarixida nechta matn bor."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM history WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def clear_history(user_id: int) -> None:
+    """Foydalanuvchi tarixini tozalaydi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+        await db.commit()

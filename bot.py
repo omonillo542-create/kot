@@ -25,11 +25,13 @@ import os
 import re
 import json
 import io
+import sys
 import uuid
 import asyncio
 import logging
 import base64
 import tempfile
+import time
 from pathlib import Path
 
 import edge_tts
@@ -57,6 +59,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, BufferedInputFile, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
     InlineQuery, InlineQueryResultVoice, InlineQueryResultArticle,
     InputTextMessageContent,
 )
@@ -67,6 +70,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import texts as T
 import database as db
+from uzbek_phonetics import prepare_for_fish
 
 # --- Edge TTS 403 fix (faqat eski versiyalar uchun) ---
 # edge-tts 7.3.0+ da v2 token qo'llab-quvvatlanadi — native URL to'g'ri ishlaydi.
@@ -88,6 +92,13 @@ except Exception:
 
 load_dotenv()
 
+# Windows konsolida emoji chiqmasligi uchun (cp1251 xatosi)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # =============================================
 # KALITLAR (faqat .env dan!)
 # =============================================
@@ -100,11 +111,27 @@ GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")  # Gemini (Google AI Studio)
 TTS_API_URL = "https://openrouter.ai/api/v1/audio/speech"
 TTS_MODEL = "fish-audio/s2.1-pro-free:free"
 
+# Fish Audio sozlamalari (.env dan o'qiladi)
+# Modellar ro'yxati: birinchisi ishlamasa keyingisiga avtomatik o'tiladi
+FISH_TTS_MODELS = [
+    m.strip()
+    for m in os.getenv("FISH_TTS_MODELS", f"{TTS_MODEL},fish-audio/s2.1-pro").split(",")
+    if m.strip()
+] or [TTS_MODEL]
+FISH_TIMEOUT = int(os.getenv("FISH_TIMEOUT", "300"))           # bitta so'rovga umumiy vaqt (s)
+FISH_CONNECT_TIMEOUT = int(os.getenv("FISH_CONNECT_TIMEOUT", "30"))  # ulanish vaqti (s)
+FISH_RETRIES = int(os.getenv("FISH_RETRIES", "2"))            # 429/5xx/timeout uchun urinishlar
+FISH_BUDGET = int(os.getenv("FISH_BUDGET", "600"))            # umumiy vaqt byudjeti (s)
+FISH_CHUNK_CHARS = int(os.getenv("FISH_CHUNK_CHARS", "900"))  # bitta so'rovdagi maksimal belgi
+FISH_UZ_MODE = os.getenv("FISH_UZ_MODE", "cyrillic").strip().lower()  # cyrillic|latin|off
+FISH_LATENCY = os.getenv("FISH_LATENCY", "high").strip().lower()      # low|normal|high
+
 # --- Kokoro TTS (asosiy TTS dvigateli) ---
 KOKORO_API_URL = os.getenv("KOKORO_API_URL", "https://strive33-kokoro-tts-fastapi.hf.space/tts")
 KOKORO_DEFAULT_VOICE = os.getenv("KOKORO_DEFAULT_VOICE", "af_heart")
 KOKORO_SPEED = float(os.getenv("KOKORO_SPEED", "1.0"))
 KOKORO_ENABLED = os.getenv("KOKORO_ENABLED", "true").lower() in ("true", "1", "yes")
+KOKORO_TIMEOUT = int(os.getenv("KOKORO_TIMEOUT", "180"))   # sekin serverlar uchun ko'proq vaqt
 
 # --- Thinking model: matnni ovozli nutqqa tayyorlash ---
 THINKING_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -147,6 +174,13 @@ EDGE_TTS_RATES = {
     "slow": "-20%",
     "normal": "+0%",
     "fast": "+25%",
+}
+
+# Fish Audio prosody tezligi (1.0 = normal)
+FISH_SPEEDS = {
+    "slow": 0.9,
+    "normal": 1.0,
+    "fast": 1.15,
 }
 
 LANG_LABELS = {"uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Rus", "en": "🇬🇧 Ingliz"}
@@ -260,6 +294,13 @@ def voice_for_gender(gender: str, index: int = 0) -> tuple[str, str]:
     pool = list(GENDER_POOLS.get(gender, UZBEK_VOICES).items())
     name, voice_id = pool[index % len(pool)]
     return voice_id, name
+
+
+def fish_voice_for_gender(gender: str, index: int = 0) -> str:
+    """Jinsga mos **Fish Audio** ovoz ID (Kokoro ID'si Fish'da ishlamaydi)."""
+    pool = list(GENDER_POOLS.get(gender, UZBEK_VOICES).items())
+    name, voice_id = pool[index % len(pool)]
+    return voice_id
 
 
 def voice_for_hint(hint: str) -> str:
@@ -398,12 +439,22 @@ def _chunk_by_sentences(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-async def safe_edit(msg: Message | None, text: str) -> None:
+async def safe_edit(
+    msg: Message | None,
+    text: str,
+    reply_markup=None,
+    parse_mode=None,
+) -> None:
     """Xabar tahrirlashda xato qaytarmasligi uchun (message is not modified va h.k.)."""
     if msg is None:
         return
     try:
-        await msg.edit_text(text)
+        kwargs = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        await msg.edit_text(text, **kwargs)
     except Exception as e:
         logger.debug(f"edit_text xatosi: {e}")
 
@@ -566,7 +617,7 @@ async def kokoro_tts(text: str, voice_id: str | None = None) -> bytes | None:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 KOKORO_API_URL, json=payload,
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=KOKORO_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -576,7 +627,7 @@ async def kokoro_tts(text: str, voice_id: str | None = None) -> bytes | None:
                         payload["voice"] = KOKORO_DEFAULT_VOICE
                         async with session.post(
                             KOKORO_API_URL, json=payload,
-                            timeout=aiohttp.ClientTimeout(total=120),
+                            timeout=aiohttp.ClientTimeout(total=KOKORO_TIMEOUT),
                         ) as retry:
                             if retry.status == 200:
                                 data = await retry.read()
@@ -593,68 +644,206 @@ async def kokoro_tts(text: str, voice_id: str | None = None) -> bytes | None:
         logger.warning(f"Kokoro TTS serverga ulanib bo'lmadi: {KOKORO_API_URL}")
         return None
     except asyncio.TimeoutError:
-        logger.warning("Kokoro TTS timeout (120s)")
+        logger.warning(f"Kokoro TTS timeout ({KOKORO_TIMEOUT}s)")
         return None
     except Exception as e:
         logger.error(f"Kokoro TTS xatosi: {e}")
         return None
 
 
-async def fish_audio_tts(text: str, voice_id: str | None = None) -> bytes | None:
-    """Fish Audio TTS (OpenRouter orqali) — Kokoro ishlamayotganda fallback."""
+async def fish_audio_tts(
+    text: str,
+    voice_id: str | None = None,
+    lang: str = "uz",
+    speed: float = 1.0,
+) -> bytes | None:
+    """Fish Audio TTS (OpenRouter orqali) — Kokoro/Edge ishlamayotganda fallback.
+
+    Yaxshilashlar:
+      1. O'zbekcha matn avval **fonetik ko'rinishga** o'tkaziladi (kirillcha):
+         Fish Audio lotin yozuvidagi o'/g'/q/x harflarini noto'g'ri o'qiydi.
+      2. Raqamlar o'zbekcha so'zlarga aylantiriladi.
+      3. Uzun matn bo'laklarga bo'linadi — bitta so'rov qisqa bo'lgani uchun
+         server "vaqt tugaydi" xatosini kamaytiradi.
+      4. Timeout oshiriladi (FISH_TIMEOUT), qayta urinishlar qo'shiladi
+         (FISH_RETRIES) va birinchi model ishlamasa ikkinchisi sinab ko'riladi.
+    """
     if not OPENROUTER_API_KEY:
         logger.warning("OPENROUTER_API_KEY topilmadi — Fish Audio TTS ishlamaydi")
         return None
 
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # O'zbekcha matnni Fish Audio uchun tayyorlash
+    prepared = prepare_for_fish(text, lang=lang, mode=FISH_UZ_MODE)
+    if prepared != text:
+        logger.debug("Fish Audio: matn o'zbekcha fonetik ko'rinishga o'tkazildi")
+
+    # Uzun matnni bo'laklarga bo'lish (timeout kamayadi, talaffuz yaxshilanadi)
+    parts = chunk_text(prepared, max_chars=FISH_CHUNK_CHARS)
+    if not parts:
+        return None
+
+    audios: list[bytes] = []
+    for part in parts:
+        data = await _fish_synthesize(part, voice_id, speed)
+        if not data:
+            if audios:
+                # Biror bo'lak ishlamasa — qolganlarini qaytaramiz
+                # (butunlay vozlikdan voz kechgandan ko'ra foydaliroq)
+                logger.warning(
+                    "Fish Audio: bir bo'lak ishlamadi, qolganlari qaytariladi"
+                )
+                break
+            return None
+        audios.append(data)
+
+    if not audios:
+        return None
+    if len(audios) == 1:
+        return audios[0]
+
+    merged = await concat_audio(audios)
+    return merged or audios[0]
+
+
+def _fish_payload(
+    model: str,
+    text: str,
+    voice_id: str | None,
+    speed: float,
+    variant: dict,
+) -> dict:
+    """Fish Audio so'rov tanasini yig'adi."""
+    payload: dict = {
+        "model": model,
+        "input": text,
+        "response_format": "mp3",
+    }
+    if variant.get("voice") and voice_id and voice_id != "default":
+        payload["voice"] = voice_id
+    if variant.get("options"):
+        payload["provider"] = {
+            "options": {
+                "fish-audio": {
+                    "normalize": True,
+                    "latency": variant.get("latency", "normal"),
+                    "prosody": {
+                        "speed": speed,
+                        "normalize_loudness": True,
+                    },
+                }
+            }
+        }
+    return payload
+
+
+async def _fish_try(
+    session: aiohttp.ClientSession,
+    headers: dict,
+    payload: dict,
+) -> tuple[str, bytes | None, str]:
+    """Bitta Fish Audio so'rovini bajaradi.
+
+    Qaytadi: (holat, audio | None, xato matni)
+      holat: "ok"    — muvaffaqiyat
+             "fatal" — so'rov xato (boshqa variantni sinash kerak)
+             "retry" — vaqt tugadi / server yuklama (qayta urinish kerak)
+    """
+    model = payload.get("model", "?")
+    try:
+        async with session.post(TTS_API_URL, headers=headers, json=payload) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                if data and len(data) > 100:
+                    return "ok", data, ""
+                return "fatal", None, f"{model}: javob juda kichik ({len(data)} bayt)"
+
+            body = ""
+            try:
+                body = (await resp.text())[:200]
+            except Exception:
+                pass
+            err = f"{model}: HTTP {resp.status} {body}"
+            if resp.status == 429 or resp.status >= 500:
+                return "retry", None, err
+            return "fatal", None, err
+    except asyncio.TimeoutError:
+        return "retry", None, f"{model}: TIMEOUT ({FISH_TIMEOUT}s)"
+    except Exception as e:
+        return "retry", None, f"{model}: {type(e).__name__}: {e}"
+
+
+async def _fish_synthesize(
+    text: str,
+    voice_id: str | None,
+    speed: float,
+) -> bytes | None:
+    """Fish Audio so'rovini variantlar va modellar zaxirasi bilan bajaradi."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": TTS_MODEL,
-        "input": text,
-        "response_format": "mp3",
-    }
-    if voice_id and voice_id != "default":
-        payload["voice"] = voice_id
+    timeout = aiohttp.ClientTimeout(
+        total=FISH_TIMEOUT,
+        sock_connect=FISH_CONNECT_TIMEOUT,
+        sock_read=FISH_TIMEOUT,
+    )
 
-    payload["provider"] = {
-        "options": {
-            "fish-audio": {
-                "normalize": True,
-                "latency": "normal",
-                "prosody": {"speed": 1.0, "normalize_loudness": True},
-            }
-        }
-    }
+    # Urinish variantlari: avval to'liq so'rov, keyin soddalashtirilgan.
+    # "high" latency sifatliroq, lekin sekin — timeout bo'lsa "normal" ga tushamiz.
+    variants = [
+        {"options": True, "voice": True, "latency": FISH_LATENCY},
+        {"options": True, "voice": True, "latency": "normal"},
+        {"options": True, "voice": False, "latency": "normal"},
+        {"options": False, "voice": True, "latency": "normal"},
+        {"options": False, "voice": False, "latency": "normal"},
+    ]
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                TTS_API_URL, headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=180),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"TTS API xatosi {resp.status}: {error_text[:300]}")
-                    # Provider options xato bersa — oddiy so'rov bilan qayta urinish
-                    if "provider" in error_text or "voice" in error_text:
-                        payload.pop("provider", None)
-                        payload.pop("voice", None)
-                        async with session.post(
-                            TTS_API_URL, headers=headers, json=payload,
-                            timeout=aiohttp.ClientTimeout(total=180),
-                        ) as retry_resp:
-                            if retry_resp.status != 200:
-                                return None
-                            data = await retry_resp.read()
-                            return data if data and len(data) > 100 else None
-                    return None
-                data = await resp.read()
-                return data if data and len(data) > 100 else None
-    except Exception as e:
-        logger.error(f"Fish Audio TTS xatosi: {e}")
-        return None
+    errors: list[str] = []
+    deadline = time.monotonic() + max(60, FISH_BUDGET)
+    retries = max(1, FISH_RETRIES)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for model in FISH_TTS_MODELS:
+            skip_variants = False
+            for variant in variants:
+                if skip_variants or time.monotonic() > deadline:
+                    break
+
+                payload = _fish_payload(model, text, voice_id, speed, variant)
+
+                for attempt in range(1, retries + 1):
+                    if time.monotonic() > deadline:
+                        break
+
+                    status, data, err = await _fish_try(session, headers, payload)
+                    if status == "ok":
+                        return data
+
+                    errors.append(err)
+                    if status == "fatal":
+                        # Bu variant yaroqsiz — keyingisini sinab ko'ramiz
+                        break
+
+                    # "retry": timeout yoki server yuklamasi
+                    if attempt < retries:
+                        await asyncio.sleep(min(2 ** attempt, 10))
+                        continue
+
+                    # Urinishlar tugadi — variantlarni tashlab, keyingi modelga
+                    skip_variants = True
+                    break
+
+            if time.monotonic() > deadline:
+                break
+
+    logger.error(
+        "Fish Audio TTS muvaffaqiyatsiz: " + " | ".join(errors[-6:])
+    )
+    return None
 
 
 async def synthesize_speech(
@@ -663,6 +852,7 @@ async def synthesize_speech(
     voice_id: str | None = None,
     gender: str = "male",
     speed: str = "normal",
+    engine: str | None = None,
 ) -> tuple[bytes | None, str]:
     """
     Matnni ovozga aylantiradi.
@@ -670,11 +860,28 @@ async def synthesize_speech(
     - Kokoro TTS ikkinchi (Edge ishlamayotganda)
     - Fish Audio uchinchi
     - gTTS oxirgi (faqat qo'llab-quvvatlanadigan tillar)
+
+    `engine` — katalogdan aniq dvigatel tanlangan bo'lsa ("kokoro"/"fish"),
+    o'sha dvigatel birinchi ishlatiladi.
+
     Qaytadi: (audio_bytes | None, qaysi dvigatel ishlatildi)
     """
     text = (text or "").strip()
     if not text:
         return None, ""
+
+    fish_speed = FISH_SPEEDS.get(speed, 1.0)
+
+    # Katalogdan aniq dvigatel tanlangan bo'lsa — birinchi o'sha
+    if engine == "fish" and OPENROUTER_API_KEY:
+        audio = await fish_audio_tts(text, voice_id, lang=lang, speed=fish_speed)
+        if audio:
+            return audio, "Fish Audio"
+
+    if engine == "kokoro" and KOKORO_ENABLED:
+        audio = await kokoro_tts(text, voice_id)
+        if audio:
+            return audio, "Kokoro TTS"
 
     # 1) Edge TTS — asosiy (har doim birinchi)
     edge_voice = get_edge_voice(lang, gender)
@@ -691,7 +898,7 @@ async def synthesize_speech(
 
     # 3) Fish Audio
     if OPENROUTER_API_KEY:
-        audio = await fish_audio_tts(text, voice_id)
+        audio = await fish_audio_tts(text, voice_id, lang=lang, speed=fish_speed)
         if audio:
             return audio, "Fish Audio"
 
@@ -712,6 +919,66 @@ async def synthesize_speech(
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 TMP_DIR = Path(__file__).parent / "tmp"
 TMP_DIR.mkdir(exist_ok=True)
+
+
+async def concat_audio(parts: list[bytes]) -> bytes | None:
+    """MP3 bo'laklarini bitta faylda birlashtiradi (FFmpeg concat demuxer).
+
+    Fish Audio matnni bo'laklarga bo'lib yuborilganda kerak bo'ladi —
+    har bir bo'lak alohida yig'ilib, keyin bitta faylda birlashtiriladi.
+    """
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+
+    uid = uuid.uuid4().hex[:12]
+    list_path = TMP_DIR / f"concat_{uid}.txt"
+    out_path = TMP_DIR / f"concat_{uid}.mp3"
+    part_paths: list[Path] = []
+
+    try:
+        lines: list[str] = []
+        for idx, part in enumerate(parts):
+            p = TMP_DIR / f"cpart_{uid}_{idx}.mp3"
+            p.write_bytes(part)
+            part_paths.append(p)
+            # FFmpeg concat demuxer uchun yo'lni "/" bilan yozamiz
+            lines.append(f"file '{p.as_posix()}'")
+        list_path.write_text("\n".join(lines), encoding="utf-8")
+
+        cmd = [
+            FFMPEG_PATH, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", str(list_path),
+            "-c", "copy", str(out_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            logger.error(
+                f"Audio birlashtirish xatosi: {stderr.decode(errors='replace')[:300]}"
+            )
+            return None
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            logger.error("Audio birlashtirish natijasi bo'sh")
+            return None
+        return out_path.read_bytes()
+    except Exception as e:
+        logger.error(f"Audio birlashtirish xatosi: {e}")
+        return None
+    finally:
+        for p in [*part_paths, list_path, out_path]:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
 
 GRANDPA_SETTINGS = {
     "pitch": 0.82,        # pastroq ovoz (0.75-0.90)
@@ -844,7 +1111,7 @@ async def improve_prompt(text: str, mode: str = "tts") -> str:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 THINKING_API_URL, headers=headers, json=payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=90),
             ) as resp:
                 if resp.status != 200:
                     return text
@@ -1260,6 +1527,20 @@ def fallback_chat_reply(text: str) -> str:
 # =============================================
 
 
+def selected_voice(settings: dict) -> tuple[str, str | None]:
+    """Katalogdan tanlangan ovozni qaytaradi: (voice_id, engine).
+
+    Tanlangan yo'q bo'lsa — ("", None) qaytaradi.
+    """
+    vid = (settings.get("voice_id") or "").strip()
+    if not vid:
+        return "", None
+    for v in VOICE_CATALOG:
+        if v["id"] == vid:
+            return v["id"], v["engine"]
+    return "", None
+
+
 async def do_tts(message: Message, processing: Message, text: str, intent: dict) -> None:
     """Matn -> ovoz."""
     speak = (intent.get("text") or text).strip()
@@ -1272,6 +1553,11 @@ async def do_tts(message: Message, processing: Message, text: str, intent: dict)
     gender = settings["voice_gender"]
     speed = settings["speed"]
 
+    # Katalogdan tanlangan aniq ovoz (agar bo'lsa) — ustunlikka ega
+    voice_id, voice_engine = selected_voice(settings)
+    if not voice_id:
+        voice_id = voice_for_hint(hint)
+
     # Agar foydalanuvchi ma'lum til/ovoz so'ragan bo'lsa — o'shani ishlatamiz
     if lang not in EDGE_TTS_VOICES:
         lang = settings["language"]
@@ -1282,7 +1568,7 @@ async def do_tts(message: Message, processing: Message, text: str, intent: dict)
     if len(speak) > MAX_TEXT_CHARS:
         speak = speak[:MAX_TEXT_CHARS]
 
-    await safe_edit(processing, T.STATUS_TTS)
+    await safe_edit(processing, T.STATUS_TTS, parse_mode=ParseMode.HTML)
     await record_voice(message)
 
     # Matnni bo'laklarga bo'lamiz
@@ -1294,13 +1580,17 @@ async def do_tts(message: Message, processing: Message, text: str, intent: dict)
     sent = 0
     for idx, chunk in enumerate(chunks, start=1):
         if len(chunks) > 1:
-            await safe_edit(processing, T.STATUS_CHUNK.format(current=idx, total=len(chunks)))
+            await safe_edit(
+                processing,
+                T.STATUS_CHUNK.format(current=idx, total=len(chunks)),
+                parse_mode=ParseMode.HTML,
+            )
             await record_voice(message)
 
         async with TTS_SEMAPHORE:
             audio, engine = await synthesize_speech(
-                chunk, lang=lang, voice_id=voice_for_hint(hint),
-                gender=gender, speed=speed,
+                chunk, lang=lang, voice_id=voice_id,
+                gender=gender, speed=speed, engine=voice_engine,
             )
 
         if not audio:
@@ -1325,7 +1615,7 @@ async def do_tts(message: Message, processing: Message, text: str, intent: dict)
     await kill(processing)
 
     if sent == 0:
-        await message.answer(T.ERR_NO_VOICE)
+        await message.answer(T.ERR_NO_VOICE, parse_mode=ParseMode.HTML)
 
 
 async def do_grandpa(message: Message, processing: Message, text: str, intent: dict) -> None:
@@ -1349,19 +1639,20 @@ async def do_grandpa(message: Message, processing: Message, text: str, intent: d
     if len(speak) > 3000:
         speak = speak[:3000]
 
-    await safe_edit(processing, T.STATUS_TTS)
+    await safe_edit(processing, T.STATUS_TTS, parse_mode=ParseMode.HTML)
     await record_voice(message)
 
     async with TTS_SEMAPHORE:
         audio, _engine = await synthesize_speech(
             speak, lang=lang, voice_id=voice_for_hint(hint),
             gender=gender, speed=speed,
+            engine="kokoro" if KOKORO_ENABLED else None,
         )
     if not audio:
-        await safe_edit(processing, T.ERR_NO_VOICE)
+        await safe_edit(processing, T.ERR_NO_VOICE, parse_mode=ParseMode.HTML)
         return
 
-    await safe_edit(processing, T.STATUS_GRANDPA)
+    await safe_edit(processing, T.STATUS_GRANDPA, parse_mode=ParseMode.HTML)
     processed = await apply_grandpa_effect(audio)
     if processed is None:
         logger.warning("Grandpa effekti ishlamadi, oddiy ovoz yuboriladi")
@@ -1383,7 +1674,7 @@ async def do_grandpa(message: Message, processing: Message, text: str, intent: d
 
 async def do_script(message: Message, processing: Message, text: str) -> None:
     """Senariy -> qahramonlarni ajratish -> har biriga alohida ovoz."""
-    await safe_edit(processing, "📜 Senariy tahlil qilinmoqda...")
+    await safe_edit(processing, T.STATUS_SCRIPT_PARSE, parse_mode=ParseMode.HTML)
     await typing(message)
 
     characters, lang = await parse_script(text)
@@ -1391,8 +1682,8 @@ async def do_script(message: Message, processing: Message, text: str) -> None:
     if not characters:
         await safe_edit(
             processing,
-            "❌ Senariy qahramonlarini topa olmadim.\n"
-            "Iltimos, senariyni 'Ism: matn' ko'rinishida jo'natib ko'ring.",
+            T.ERR_SCRIPT_PARSE,
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -1401,13 +1692,23 @@ async def do_script(message: Message, processing: Message, text: str) -> None:
         f"({len(c['lines'])} ta replika)"
         for c in characters
     )
-    await message.answer(clip(f"🎭 {len(characters)} ta qahramon topildi:\n{summary_lines}"))
+    await message.answer(
+        T.SCRIPT_FOUND.format(
+            count=len(characters), summary=summary_lines
+        ),
+        parse_mode=ParseMode.HTML,
+    )
 
     used = {"male": 0, "female": 0, "child": 0}
     sent = 0
 
+    settings = await db.get_settings(message.from_user.id)
+    fish_speed = FISH_SPEEDS.get(settings.get("speed", "normal"), 1.0)
+
     for ch in characters:
         voice_id, voice_name = voice_for_gender(ch["gender"], used[ch["gender"]])
+        # Fish Audio uchun alohida (Fish'ga tegishli) ovoz kerak
+        fish_voice = fish_voice_for_gender(ch["gender"], used[ch["gender"]])
         used[ch["gender"]] += 1
 
         parts = chunk_lines(ch["lines"])
@@ -1422,7 +1723,9 @@ async def do_script(message: Message, processing: Message, text: str) -> None:
             # u ishlamasa — Fish Audio -> gTTS ga fallback
             audio = await kokoro_tts(part, voice_id)
             if not audio:
-                audio = await fish_audio_tts(part, voice_id)
+                audio = await fish_audio_tts(
+                    part, fish_voice, lang=lang, speed=fish_speed
+                )
             if not audio:
                 audio = await gtts_speak(part, lang)
 
@@ -1440,11 +1743,15 @@ async def do_script(message: Message, processing: Message, text: str) -> None:
             sent += 1
 
     if sent == 0:
-        await safe_edit(processing, "❌ Ovozlarni yaratib bo'lmadi. Qayta urinib ko'ring.")
+        await safe_edit(
+            processing, "❌ Ovozlarni yaratib bo'lmadi. Qayta urinib ko'ring."
+        )
         return
 
     await kill(processing)
-    await message.answer(f"✅ Tayyor! {sent} ta ovozli xabar yuborildi. 🎉")
+    await message.answer(
+        T.SCRIPT_DONE.format(count=sent), parse_mode=ParseMode.HTML
+    )
 
 
 async def do_chat(message: Message, processing: Message, text: str,
@@ -1463,8 +1770,17 @@ async def do_chat(message: Message, processing: Message, text: str,
     await safe_edit(processing, clip(clean_ai_text(reply), TG_MSG_LIMIT))
 
 
-async def run_pipeline(message: Message, user_text: str, processing: Message) -> None:
-    """Asosiy AI oqimi: niyat aniqlash -> amal bajarish."""
+async def run_pipeline(
+    message: Message,
+    user_text: str,
+    processing: Message,
+    force: str = "auto",
+) -> None:
+    """Asosiy AI oqimi: niyat aniqlash -> amal bajarish.
+
+    `force` — "auto" bo'lmasa, AI niyat aniqlash o'rniga shu rejim
+    majburan qo'llaniladi (menyu orqali tanlangan rejim).
+    """
     text = (user_text or "").strip()
     if not text:
         await safe_edit(processing, T.ERR_EMPTY_TEXT)
@@ -1474,13 +1790,28 @@ async def run_pipeline(message: Message, user_text: str, processing: Message) ->
 
     # Kunlik limitni tekshiramiz
     if not await db.check_daily_limit(uid, DAILY_LIMIT):
-        await safe_edit(processing, T.ERR_DAILY_LIMIT.format(limit=DAILY_LIMIT))
+        await safe_edit(
+            processing,
+            T.ERR_DAILY_LIMIT.format(limit=DAILY_LIMIT),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     try:
         await typing(message)
         history = get_history(uid)
-        intent = await detect_intent(text, history)
+        if force and force != "auto":
+            # Rejim menyudan tanlangan — AI aniqlash kerak emas
+            intent = {
+                "intent": force,
+                "text": text,
+                "lang": "uz",
+                "voice": "default",
+                "reply": "",
+            }
+            logger.info(f"Intent: {force} (tanlangan rejim)")
+        else:
+            intent = await detect_intent(text, history)
         kind = intent["intent"]
 
         # Matnni tarixga saqlaymiz
@@ -1550,30 +1881,35 @@ dp.inline_query.middleware(throttling_middleware)
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    """/start — AI salomlashuv, so'ng AI suhbat rejimi."""
+    """/start — professional bosh menyu."""
     uid = message.from_user.id
     user_data[uid] = {"history": []}
     await state.set_state(Flow.ai_chat)
-    await typing(message)
 
     # Foydalanuvchini bazaga qo'shamiz
     await db.get_settings(uid)
 
-    greeting = None
-    if GEMINI_API_KEY:
-        greeting = await gemini_chat(
-            "Foydalanuvchi botni yangi boshladi (start bosdi).",
-            GREETING_SYSTEM,
-        )
-    if greeting:
-        await message.answer(clip(clean_ai_text(greeting), 3900))
-    else:
-        await message.answer(clip(T.GREETING, 3900), parse_mode=ParseMode.HTML)
+    # Bosh menyu
+    await message.answer(
+        clip(T.GREETING, 3900),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu(),
+    )
+    # Doimiy pastki tugmalar
+    await message.answer(
+        "⬇️ <i>Quyidagi tugmalar doim ko'rinib turadi</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_bottom_menu(),
+    )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(T.HELP, parse_mode=ParseMode.HTML)
+    await message.answer(
+        T.HELP_HEADER + T.HELP_BODY,
+        reply_markup=build_back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.message(Command("history"))
@@ -1582,13 +1918,19 @@ async def cmd_history(message: Message):
     uid = message.from_user.id
     history = await db.get_history(uid, limit=10)
     if not history:
-        await message.answer(T.HISTORY_EMPTY)
+        await message.answer(
+            T.HISTORY_EMPTY,
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    lines = [T.HISTORY_HEADER.format(count=len(history))]
-    for i, text in enumerate(reversed(history), start=1):
-        lines.append(f"{i}. {clip(text, 100)}")
-    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+    text = T.HISTORY_HEADER.format(count=len(history))
+    await message.answer(
+        text,
+        reply_markup=build_history_keyboard(history),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.message(Command("reset"))
@@ -1596,7 +1938,426 @@ async def cmd_reset(message: Message, state: FSMContext):
     uid = message.from_user.id
     user_data[uid] = {"history": []}
     await state.set_state(Flow.ai_chat)
-    await message.answer(T.RESET_DONE)
+    await message.answer(T.RESET_DONE, parse_mode=ParseMode.HTML)
+
+
+# =============================================
+# PROFESSIONAL UI — menyular, tugmalar, katalog
+# =============================================
+
+# --- Tanlangan rejim (har bir foydalanuvchi uchun) ---
+# "auto" | "tts" | "grandpa" | "script"
+_user_mode: dict[int, str] = {}
+
+MODE_LABELS = {
+    "auto": "AI avtomatik",
+    "tts": "Matn → Ovoz",
+    "grandpa": "Keksa effekti",
+    "script": "Senariy",
+}
+
+MODE_TEXTS = {
+    "tts": T.MODE_TTS,
+    "grandpa": T.MODE_GRANDPA,
+    "script": T.MODE_SCRIPT,
+    "auto": T.MODE_AI,
+    "ai": T.MODE_AI,   # menyudagi "🧠 AI rejimi" tugmasi
+}
+
+
+def get_mode(uid: int) -> str:
+    """Foydalanuvchining tanlagan rejimini qaytaradi."""
+    return _user_mode.get(uid, "auto")
+
+
+def set_mode(uid: int, mode: str) -> None:
+    _user_mode[uid] = mode
+
+
+# --- Ovoz katalogi ---
+VOICE_CATALOG: list[dict] = [
+    {"name": "🧔 Erkak · Rasmiy", "engine": "kokoro", "id": "am_michael",
+     "gender": "male", "desc": "Aniq, rasmiy, ishonchli"},
+    {"name": "👨 Erkak · Tabiiy", "engine": "kokoro", "id": "am_liam",
+     "gender": "male", "desc": "Yumshoq, tabiiy, samimiy"},
+    {"name": "🧑 Erkak · Chuqur", "engine": "kokoro", "id": "am_adam",
+     "gender": "male", "desc": "Chuqur, ziddiyatli"},
+    {"name": "🧔 Erkak · Do'stona", "engine": "kokoro", "id": "am_eric",
+     "gender": "male", "desc": "Do'stona, iliq"},
+    {"name": "👩 Ayol · Tabiiy", "engine": "kokoro", "id": "af_heart",
+     "gender": "female", "desc": "Tabiiy, iliq, tinch"},
+    {"name": "👩‍🦰 Ayol · Ekspressiv", "engine": "kokoro", "id": "af_bella",
+     "gender": "female", "desc": "Jonli, ekspressiv"},
+    {"name": "🧘 Ayol · Sokin", "engine": "kokoro", "id": "af_nicole",
+     "gender": "female", "desc": "Sokin, meditativ"},
+    {"name": "👩 Ayol · Suhbatdosh", "engine": "kokoro", "id": "af_sarah",
+     "gender": "female", "desc": "Yangi, suhbatdosh"},
+    {"name": "🧒 Bola · Yosh", "engine": "kokoro", "id": "am_puck",
+     "gender": "child", "desc": "Yosh, quvnoq, serb"},
+    {"name": "👶 Bola · Ilhom", "engine": "kokoro", "id": "af_nova",
+     "gender": "child", "desc": "Yumshoq, ilhomlantiruvchi"},
+    {"name": "👴 Keksa · Chuqur", "engine": "kokoro", "id": "am_echo",
+     "gender": "grandpa", "desc": "Chuqur, keksa, donish"},
+    {"name": "👴 Keksa · Hikoyachi", "engine": "kokoro", "id": "bm_george",
+     "gender": "grandpa", "desc": "Hikoyachi, ko'ngilli"},
+    {"name": "🇺🇿 O'zbek · Erkak", "engine": "fish",
+     "id": "44ad146afad04e4e99a7b98b8f97106f", "gender": "male",
+     "desc": "Fish Audio — kirill moslash, to'g'ri o'zbek talaffuzi"},
+    {"name": "🇺🇿 O'zbek · Ayol", "engine": "fish",
+     "id": "933563129e564b19a115bedd57b7406a", "gender": "female",
+     "desc": "Fish Audio — kirill moslash, to'g'ri o'zbek talaffuzi"},
+]
+
+VOICE_SAMPLE = "Salom! Men sizning ovoz yordamchingizman. Bugun nima qilamiz?"
+
+
+# --- Klaviaturalar ---
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    """Bosh menyu — asosiy inline tugmalar (2 ustunli)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    buttons = T.MAIN_MENU_BUTTONS
+    for i in range(0, len(buttons), 2):
+        chunk = buttons[i:i + 2]
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=action)
+            for label, action in chunk
+        ])
+    rows.append([
+        InlineKeyboardButton(text=T.BTN_HOME, callback_data="menu:home"),
+        InlineKeyboardButton(text=T.BTN_CLOSE, callback_data="menu:close"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_bottom_menu() -> ReplyKeyboardMarkup:
+    """Pastki menyu — doimiy ko'rinadigan tugmalar."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=T.BOTTOM_TTS), KeyboardButton(text=T.BOTTOM_STT)],
+            [KeyboardButton(text=T.BOTTOM_GRANDPA), KeyboardButton(text=T.BOTTOM_SCRIPT)],
+            [KeyboardButton(text=T.BOTTOM_SETTINGS), KeyboardButton(text=T.BOTTOM_HELP)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=T.BOTTOM_PLACEHOLDER,
+    )
+
+
+def build_back_keyboard() -> InlineKeyboardMarkup:
+    """Faqat bosh menyuga qaytish tugmasi."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.BTN_HOME, callback_data="menu:home")],
+    ])
+
+
+def build_voice_catalog() -> InlineKeyboardMarkup:
+    """Ovoz katalogi — 2 ustunli to'r."""
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, voice in enumerate(VOICE_CATALOG):
+        row.append(
+            InlineKeyboardButton(text=voice["name"], callback_data=f"vprev:{idx}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text=T.BTN_HOME, callback_data="menu:home"),
+        InlineKeyboardButton(text=T.BTN_CLOSE, callback_data="menu:close"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_history_keyboard(history: list[str]) -> InlineKeyboardMarkup:
+    """Tarix — har bir matn uchun tugma."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, text in enumerate(history):
+        label = clip(text, 28) or "(bo'sh)"
+        rows.append([
+            InlineKeyboardButton(text=f"🔊 {label}", callback_data=f"hist:{idx}")
+        ])
+    rows.append([
+        InlineKeyboardButton(text="🧹 Tozalash", callback_data="menu:clear_history"),
+        InlineKeyboardButton(text=T.BTN_HOME, callback_data="menu:home"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- Matnlar ---
+
+async def home_text(uid: int) -> str:
+    """Bosh menyu matni (joriy rejim va til bilan)."""
+    s = await db.get_settings(uid)
+    mode = MODE_LABELS.get(get_mode(uid), MODE_LABELS["auto"])
+    lang = LANG_LABELS.get(s["language"], s["language"])
+    return (
+        T.MAIN_TITLE
+        + T.MAIN_SUBTITLE + "\n\n"
+        + f"🧠 Rejim: <b>{mode}</b>\n"
+        + f"🌍 Til: <b>{lang}</b>"
+    )
+
+
+async def stats_text(uid: int) -> str:
+    """Foydalanuvchi statistikasi."""
+    s = await db.get_settings(uid)
+    today, total = await db.get_user_usage(uid)
+    hist = await db.get_user_history_count(uid)
+    return (
+        T.STATS_HEADER
+        + T.STATS_CARD.format(
+            today=today,
+            total=total,
+            history=hist,
+            lang=LANG_LABELS.get(s["language"], s["language"]),
+            voice=GENDER_LABELS_UI.get(s["voice_gender"], s["voice_gender"]),
+            speed=SPEED_LABELS.get(s["speed"], s["speed"]),
+        )
+    )
+
+
+# --- Rejimni o'zgartirish ---
+
+async def apply_mode(uid: int, mode: str) -> str:
+    """Rejimni o'zgartiradi va foydalanuvchiga xabar beradi."""
+    if mode == "ai":
+        mode = "auto"
+    set_mode(uid, mode)
+    return MODE_TEXTS.get(mode, T.MODE_AI)
+
+
+# --- Ovoz namunasi ---
+
+async def preview_voice(entry: dict) -> bytes | None:
+    """Ovoz namunasini yaratadi (tanlangan dvigatel bilan)."""
+    if entry.get("engine") == "fish":
+        audio = await fish_audio_tts(
+            VOICE_SAMPLE, entry["id"], lang="uz", speed=1.0
+        )
+    else:
+        audio = await kokoro_tts(VOICE_SAMPLE, entry["id"])
+    if not audio:
+        # Zaxira: Edge TTS
+        audio = await edge_tts_speak(
+            VOICE_SAMPLE, get_edge_voice("uz", entry.get("gender", "male"))
+        )
+    return audio
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def menu_callback(callback: CallbackQuery):
+    """Bosh menyu tugmalari boshqaruvi."""
+    action = callback.data.split(":", 1)[1]
+    uid = callback.from_user.id
+    await callback.answer()
+
+    if action == "close":
+        await safe_edit(
+            callback.message,
+            "✖️ Yopildi. <i>/start</i> — qayta ochish.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "home":
+        await safe_edit(
+            callback.message,
+            await home_text(uid),
+            reply_markup=build_main_menu(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action in MODE_TEXTS:
+        text = await apply_mode(uid, action)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "stt":
+        await safe_edit(
+            callback.message, T.MODE_STT,
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "voices":
+        await safe_edit(
+            callback.message, T.VOICE_CATALOG_HEADER,
+            reply_markup=build_voice_catalog(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "history":
+        history = await db.get_history(uid, limit=10)
+        if not history:
+            await safe_edit(
+                callback.message, T.HISTORY_EMPTY,
+                reply_markup=build_back_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        text = T.HISTORY_HEADER.format(count=len(history))
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_history_keyboard(history),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "clear_history":
+        await db.clear_history(uid)
+        user_data[uid] = {"history": []}
+        await safe_edit(
+            callback.message, T.HISTORY_CLEARED,
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "settings":
+        text = await settings_summary(uid)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "stats":
+        await safe_edit(
+            callback.message, await stats_text(uid),
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "help":
+        await safe_edit(
+            callback.message, T.HELP_HEADER + T.HELP_BODY,
+            reply_markup=build_back_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+
+@dp.callback_query(F.data.startswith("vprev:"))
+async def voice_preview_callback(callback: CallbackQuery):
+    """Ovoz namunasi: eshitish + tanlash."""
+    uid = callback.from_user.id
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("❌ Ovoz topilmadi")
+        return
+
+    if idx < 0 or idx >= len(VOICE_CATALOG):
+        await callback.answer("❌ Ovoz topilmadi")
+        return
+
+    entry = VOICE_CATALOG[idx]
+    await callback.answer("🔊 Namuna tayyorlanmoqda…")
+
+    async with TTS_SEMAPHORE:
+        audio = await preview_voice(entry)
+
+    if not audio:
+        await callback.message.answer(T.VOICE_PREVIEW_ERROR)
+        return
+
+    ogg = await mp3_to_ogg(audio)
+    voice_file = (
+        BufferedInputFile(ogg, filename="preview.ogg") if ogg
+        else BufferedInputFile(audio, filename="preview.mp3")
+    )
+    await callback.message.answer_voice(
+        voice=voice_file,
+        caption=f"🔊 <b>{entry['name']}</b>\n<i>{entry['desc']}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Tanlaymiz
+    await db.update_settings(
+        uid, voice_id=entry["id"], voice_gender=entry.get("gender", "male")
+    )
+    await safe_edit(
+        callback.message,
+        T.VOICE_SELECTED.format(name=entry["name"], desc=entry["desc"]),
+        reply_markup=build_back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.callback_query(F.data.startswith("hist:"))
+async def history_callback(callback: CallbackQuery):
+    """Tarixdagi matnni qayta ovozga aylantiradi."""
+    uid = callback.from_user.id
+    await callback.answer("🔊 Tayyorlanmoqda…")
+
+    try:
+        idx = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        return
+
+    history = await db.get_history(uid, limit=10)
+    if idx < 0 or idx >= len(history):
+        await callback.message.answer(T.HISTORY_EMPTY, parse_mode=ParseMode.HTML)
+        return
+
+    text = history[idx]
+    processing = await callback.message.answer(T.STATUS_TTS, parse_mode=ParseMode.HTML)
+    await run_pipeline(callback.message, text, processing, force="tts")
+
+
+# --- Pastki menyu tugmalari ---
+BOTTOM_ACTIONS = {
+    T.BOTTOM_TTS: "tts",
+    T.BOTTOM_GRANDPA: "grandpa",
+    T.BOTTOM_SCRIPT: "script",
+    T.BOTTOM_STT: "stt",
+}
+
+
+@dp.message(F.text.in_(list(BOTTOM_ACTIONS.keys())))
+async def bottom_menu_handler(message: Message):
+    """Pastki menyudagi tugmalar."""
+    uid = message.from_user.id
+    action = BOTTOM_ACTIONS.get((message.text or "").strip())
+    if action is None:
+        return
+
+    if action == "stt":
+        await message.answer(T.MODE_STT, parse_mode=ParseMode.HTML)
+        return
+
+    text = await apply_mode(uid, action)
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@dp.message(F.text.in_([T.BOTTOM_SETTINGS]))
+async def bottom_settings_handler(message: Message):
+    """Pastki menyudagi sozlamalar tugmasi."""
+    text = await settings_summary(message.from_user.id)
+    await message.answer(
+        text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML
+    )
+
+
+@dp.message(F.text.in_([T.BOTTOM_HELP]))
+async def bottom_help_handler(message: Message):
+    """Pastki menyudagi yordam tugmasi."""
+    await message.answer(
+        T.HELP_HEADER + T.HELP_BODY,
+        reply_markup=build_back_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # =============================================
@@ -1610,42 +2371,68 @@ def build_settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=T.CHOOSE_LANG, callback_data="settings:lang")],
         [InlineKeyboardButton(text=T.CHOOSE_VOICE, callback_data="settings:voice")],
         [InlineKeyboardButton(text=T.CHOOSE_SPEED, callback_data="settings:speed")],
-        [InlineKeyboardButton(text=T.BTN_REFRESH, callback_data="settings:refresh")],
+        [
+            InlineKeyboardButton(text=T.BTN_HOME, callback_data="menu:home"),
+            InlineKeyboardButton(text=T.BTN_CLOSE, callback_data="menu:close"),
+        ],
     ])
 
 
-def build_lang_keyboard() -> InlineKeyboardMarkup:
+def _mark(label: str, code: str, current: str) -> str:
+    """Joriy tanlovni ✅ bilan belgilaydi."""
+    return f"✅ {label}" if code == current else label
+
+
+def build_lang_keyboard(current: str = "uz") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=T.BTN_LANG_UZ, callback_data="lang:uz")],
-        [InlineKeyboardButton(text=T.BTN_LANG_RU, callback_data="lang:ru")],
-        [InlineKeyboardButton(text=T.BTN_LANG_EN, callback_data="lang:en")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+        [
+            InlineKeyboardButton(text=_mark(T.BTN_LANG_UZ, "uz", current), callback_data="lang:uz"),
+            InlineKeyboardButton(text=_mark(T.BTN_LANG_RU, "ru", current), callback_data="lang:ru"),
+            InlineKeyboardButton(text=_mark(T.BTN_LANG_EN, "en", current), callback_data="lang:en"),
+        ],
+        [InlineKeyboardButton(text=T.BTN_BACK, callback_data="settings:refresh")],
     ])
 
 
-def build_voice_keyboard() -> InlineKeyboardMarkup:
+def build_voice_keyboard(current: str = "male") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=T.BTN_VOICE_MALE, callback_data="voice:male")],
-        [InlineKeyboardButton(text=T.BTN_VOICE_FEMALE, callback_data="voice:female")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+        [
+            InlineKeyboardButton(text=_mark(T.BTN_VOICE_MALE, "male", current), callback_data="voice:male"),
+            InlineKeyboardButton(text=_mark(T.BTN_VOICE_FEMALE, "female", current), callback_data="voice:female"),
+        ],
+        [
+            InlineKeyboardButton(text="🗣 Barcha ovozlar", callback_data="menu:voices"),
+            InlineKeyboardButton(text=T.BTN_BACK, callback_data="settings:refresh"),
+        ],
     ])
 
 
-def build_speed_keyboard() -> InlineKeyboardMarkup:
+def build_speed_keyboard(current: str = "normal") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=T.BTN_SPEED_SLOW, callback_data="speed:slow")],
-        [InlineKeyboardButton(text=T.BTN_SPEED_NORMAL, callback_data="speed:normal")],
-        [InlineKeyboardButton(text=T.BTN_SPEED_FAST, callback_data="speed:fast")],
-        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="settings:refresh")],
+        [
+            InlineKeyboardButton(text=_mark(T.BTN_SPEED_SLOW, "slow", current), callback_data="speed:slow"),
+            InlineKeyboardButton(text=_mark(T.BTN_SPEED_NORMAL, "normal", current), callback_data="speed:normal"),
+            InlineKeyboardButton(text=_mark(T.BTN_SPEED_FAST, "fast", current), callback_data="speed:fast"),
+        ],
+        [InlineKeyboardButton(text=T.BTN_BACK, callback_data="settings:refresh")],
     ])
 
 
 async def settings_summary(user_id: int) -> str:
     """Foydalanuvchining hozirgi sozlamalari haqida matn qaytaradi."""
     s = await db.get_settings(user_id)
+
+    # Tanlangan aniq ovoz katalogda bormi?
+    voice_name = GENDER_LABELS_UI.get(s["voice_gender"], s["voice_gender"])
+    vid = s.get("voice_id") or ""
+    for v in VOICE_CATALOG:
+        if v["id"] == vid:
+            voice_name = v["name"]
+            break
+
     return T.SETTINGS_HEADER + "\n\n" + T.SETTINGS_SUMMARY.format(
         lang=LANG_LABELS.get(s["language"], s["language"]),
-        voice=GENDER_LABELS_UI.get(s["voice_gender"], s["voice_gender"]),
+        voice=voice_name,
         speed=SPEED_LABELS.get(s["speed"], s["speed"]),
     )
 
@@ -1662,19 +2449,36 @@ async def settings_callback(callback: CallbackQuery):
     """Sozlamalar tugmalari boshqaruvi."""
     uid = callback.from_user.id
     action = callback.data.split(":", 1)[1]
+    s = await db.get_settings(uid)
 
     if action == "lang":
         text = await settings_summary(uid) + "\n\n" + T.CHOOSE_LANG
-        await callback.message.edit_text(text, reply_markup=build_lang_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_lang_keyboard(s["language"]),
+            parse_mode=ParseMode.HTML,
+        )
     elif action == "voice":
         text = await settings_summary(uid) + "\n\n" + T.CHOOSE_VOICE
-        await callback.message.edit_text(text, reply_markup=build_voice_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_voice_keyboard(s["voice_gender"]),
+            parse_mode=ParseMode.HTML,
+        )
     elif action == "speed":
         text = await settings_summary(uid) + "\n\n" + T.CHOOSE_SPEED
-        await callback.message.edit_text(text, reply_markup=build_speed_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_speed_keyboard(s["speed"]),
+            parse_mode=ParseMode.HTML,
+        )
     elif action == "refresh":
         text = await settings_summary(uid)
-        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
 
     await callback.answer()
 
@@ -1688,7 +2492,11 @@ async def lang_callback(callback: CallbackQuery):
         await db.update_settings(uid, language=lang)
         text = T.SETTINGS_LANG_SET.format(lang=LANG_LABELS.get(lang, lang)) + "\n\n"
         text += await settings_summary(uid)
-        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
     await callback.answer()
 
 
@@ -1698,10 +2506,15 @@ async def voice_callback(callback: CallbackQuery):
     uid = callback.from_user.id
     gender = callback.data.split(":", 1)[1]
     if gender in db.VALID_GENDERS:
-        await db.update_settings(uid, voice_gender=gender)
+        # Jins o'zgarganda katalogdagi aniq ovoz tozalanadi
+        await db.update_settings(uid, voice_gender=gender, voice_id="")
         text = T.SETTINGS_VOICE_SET.format(voice=GENDER_LABELS_UI.get(gender, gender)) + "\n\n"
         text += await settings_summary(uid)
-        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
     await callback.answer()
 
 
@@ -1714,7 +2527,11 @@ async def speed_callback(callback: CallbackQuery):
         await db.update_settings(uid, speed=speed)
         text = T.SETTINGS_SPEED_SET.format(speed=SPEED_LABELS.get(speed, speed)) + "\n\n"
         text += await settings_summary(uid)
-        await callback.message.edit_text(text, reply_markup=build_settings_keyboard(), parse_mode=ParseMode.HTML)
+        await safe_edit(
+            callback.message, text,
+            reply_markup=build_settings_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
     await callback.answer()
 
 
@@ -1888,7 +2705,7 @@ async def voice_message_handler(message: Message, state: FSMContext):
         )
         return
 
-    processing = await message.answer(T.STATUS_VOICE_HEARING)
+    processing = await message.answer(T.STATUS_VOICE_HEARING, parse_mode=ParseMode.HTML)
     tmp_path = TMP_DIR / f"stt_{uuid.uuid4().hex[:12]}.ogg"
 
     try:
@@ -1897,7 +2714,7 @@ async def voice_message_handler(message: Message, state: FSMContext):
         audio_bytes = tmp_path.read_bytes()
         mime_type = "audio/ogg" if message.voice else "audio/mpeg"
 
-        await safe_edit(processing, T.STATUS_TRANSCRIBING)
+        await safe_edit(processing, T.STATUS_TRANSCRIBING, parse_mode=ParseMode.HTML)
         transcript = await gemini_stt(audio_bytes, mime_type)
 
         if not transcript:
@@ -1997,7 +2814,7 @@ async def document_handler(message: Message, state: FSMContext):
         )
         return
 
-    processing = await message.answer(T.STATUS_FILE_READING)
+    processing = await message.answer(T.STATUS_FILE_READING, parse_mode=ParseMode.HTML)
     tmp_path = TMP_DIR / f"doc_{uuid.uuid4().hex[:12]}{ext}"
 
     try:
@@ -2034,15 +2851,18 @@ async def document_handler(message: Message, state: FSMContext):
 
 @dp.message(F.text)
 async def text_message_handler(message: Message, state: FSMContext):
-    """AI suhbat rejimi — matn keladi, Gemini niyatni aniqlaydi."""
+    """AI suhbat rejimi — matn keladi, niyat aniqlanadi va bajariladi."""
     await state.set_state(Flow.ai_chat)
 
     text = (message.text or "").strip()
     if not text:
         return
 
-    processing = await message.answer("🧠 Tahlil qilinmoqda...")
-    await run_pipeline(message, text, processing)
+    uid = message.from_user.id
+    mode = get_mode(uid)
+
+    processing = await message.answer(T.STATUS_THINKING, parse_mode=ParseMode.HTML)
+    await run_pipeline(message, text, processing, force=mode)
 
 
 @dp.message()
@@ -2168,14 +2988,28 @@ async def inline_handler(inline_query: InlineQuery):
     # Foydalanuvchi sozlamalari + tez til aniqlash
     settings = await db.get_settings(uid)
     lang = detect_lang_fast(text)
-    voice = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["uz"]).get(
-        settings["voice_gender"], "uz-UZ-SardorNeural"
-    )
     rate = EDGE_TTS_RATES.get(settings["speed"], "+0%")
 
-    # Ovoz yaratamiz (Edge TTS — tez, ~0.5-1s)
+    # Katalogdan tanlangan aniq ovoz (agar bo'lsa) — ustunlikka ega
+    sel_id, sel_engine = selected_voice(settings)
+    engine_label = "Edge TTS"
+
     async with TTS_SEMAPHORE:
-        audio = await edge_tts_speak(text, voice, rate=rate)
+        if sel_engine == "kokoro":
+            engine_label = "Kokoro TTS"
+            audio = await kokoro_tts(text, sel_id)
+        elif sel_engine == "fish":
+            engine_label = "Fish Audio"
+            audio = await fish_audio_tts(
+                text, sel_id, lang=lang,
+                speed=FISH_SPEEDS.get(settings["speed"], 1.0),
+            )
+        else:
+            voice = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES["uz"]).get(
+                settings["voice_gender"], "uz-UZ-SardorNeural"
+            )
+            # Edge TTS — tez, ~0.5-1s
+            audio = await edge_tts_speak(text, voice, rate=rate)
 
     if not audio:
         await inline_query.answer(
@@ -2210,7 +3044,9 @@ async def inline_handler(inline_query: InlineQuery):
     result = InlineQueryResultVoice(
         id=uuid.uuid4().hex,
         voice=url,
-        caption=T.TTS_DONE.format(engine="Edge TTS", lang=lang.upper(), chars=len(text)),
+        caption=T.TTS_DONE.format(
+            engine=engine_label, lang=lang.upper(), chars=len(text)
+        ),
     )
     await inline_query.answer(
         results=[result], cache_time=3600, is_personal=True

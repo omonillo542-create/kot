@@ -19,6 +19,7 @@ bot.db
 
 # Test fayllari va artefaktlar
 test_*.py
+!test_uzbek_phonetics.py
 test_fayl.*
 changelog.txt
 
