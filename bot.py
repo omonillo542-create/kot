@@ -966,7 +966,10 @@ async def gemini_tts(text: str, voice: str = "Kore", lang: str = "uz") -> bytes 
                 if resp.status != 200:
                     body = (await resp.text())[:250]
                     logger.error(f"Gemini TTS xatosi {resp.status}: {body}")
-                    if resp.status in (400, 401, 403):
+                    if resp.status == 429:
+                        # Kvota tugdi — qisqa muddatga kutamiz (kalit buzuq emas)
+                        _mark_broken("gemini", ttl=60)
+                    elif resp.status in (400, 401, 403):
                         _mark_broken("gemini")
                     return None
 
@@ -1116,8 +1119,7 @@ async def synthesize_speech(
 
     fish_speed = FISH_SPEEDS.get(speed, 1.0)
 
-    # 0) AI TTS — realistik ovoz (Gemini / OpenAI).
-    #    Aniq ovoz tanlangan bo'lsa — o'sha dvigatel birinchi.
+    # 0) Aniq tanlangan dvigatel — faqat o'sha birinchi ishlatiladi
     if engine == "gemini":
         audio = await gemini_tts(text, voice_id or "Kore", lang)
         if audio:
@@ -1126,8 +1128,16 @@ async def synthesize_speech(
         audio = await openai_tts(text, voice_id or "alloy", lang)
         if audio:
             return audio, "OpenAI TTS"
-    elif AI_TTS_FIRST:
-        # Kalit mavjud bo'lsa — avval realistik AI ovozi
+    elif engine == "kokoro" and KOKORO_ENABLED:
+        audio = await kokoro_tts(text, voice_id)
+        if audio:
+            return audio, "Kokoro TTS"
+    elif engine == "fish" and OPENROUTER_API_KEY:
+        audio = await fish_audio_tts(text, voice_id, lang=lang, speed=fish_speed)
+        if audio:
+            return audio, "Fish Audio"
+    elif engine is None and AI_TTS_FIRST:
+        # Aniq ovoz tanlanmagan — realistik AI ovozi birinchi (kalit bor bo'lsa)
         if GEMINI_API_KEY and GEMINI_TTS_ENABLED and not _key_broken("gemini"):
             audio = await gemini_tts(text, "Kore", lang)
             if audio:
