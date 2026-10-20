@@ -144,18 +144,18 @@ THINKING_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 THINKING_MODEL = os.getenv("THINKING_MODEL", "meta-llama/llama-3.3-70b-instruct")
 
 # --- AI TTS dvigatellari (realistik ovoz) ---
-# Gemini 2.5 Flash TTS — AI Studio bepul tierida, o'zbek tilini qo'llab-quvvatlaydi
-GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+# Gemini 3.8 Flash TTS — AI Studio bepul tierida, o'zbek tilini qo'llab-quvvatlaydi
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 GEMINI_TTS_ENABLED = os.getenv("GEMINI_TTS_ENABLED", "true").lower() in ("true", "1", "yes")
 GEMINI_TTS_VOICES = {
-    "🔮 Zephyr": "Zephyr",
+    "💫 Kore": "Kore",
     "🔊 Puck": "Puck",
     "🌊 Charon": "Charon",
-    "💫 Kore": "Kore",
     "🎭 Fenrir": "Fenrir",
     "🌸 Aoede": "Aoede",
     "🎵 Leda": "Leda",
     "🗣 Orus": "Orus",
+    "🔮 Zephyr": "Zephyr",
 }
 
 # OpenAI TTS — juda realistik, lekin to'lovli
@@ -207,7 +207,9 @@ LLM_API_KEY = OPENROUTER_API_KEY or OPENROUTER_THINKING_KEY
 
 # --- Gemini (Google AI Studio) ---
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+# Eski "gemini-2.5-flash" yangi foydalanuvchilar uchun 404 beradi
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_STT_MODEL = os.getenv("GEMINI_STT_MODEL", "gemini-3.5-transcribe")
 
 # --- Cheklovlar ---
 MAX_VOICE_SECONDS = 300     # 5 daqiqa
@@ -1037,6 +1039,20 @@ async def openai_tts(text: str, voice: str = "alloy", lang: str = "uz") -> bytes
 # =============================================
 
 
+def _gemini_key_works() -> bool:
+    """Gemini kalitini haqiqiy so'rov bilan tekshiradi (AIza... yoki AQ...)."""
+    if not GEMINI_API_KEY:
+        return False
+    try:
+        import urllib.request
+        url = f"{GEMINI_BASE_URL}?key={GEMINI_API_KEY}"
+        req = urllib.request.Request(url, headers={"x-goog-api-key": GEMINI_API_KEY})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def validate_keys() -> None:
     """Kalitlarni tekshiradi va aniq ogohlantirish beradi."""
     problems: list[str] = []
@@ -1050,12 +1066,16 @@ def validate_keys() -> None:
             "MIYYA_API_KEY yo'q — Gemini TTS/STT ishlamaydi "
             "(Edge TTS va lokal Whisper ishlayveradi)"
         )
-    elif not GEMINI_API_KEY.startswith("AIza"):
-        problems.append(
-            "MIYYA_API_KEY ESKI FORMATDA (AQ... boshlanadi) — "
-            "Gemini API uchun yangi 'AIza...' kaliti kerak "
-            "(https://aistudio.google.com/apikey). Hozircha AI TTS o'chiriladi."
-        )
+    else:
+        # Kalit formatini emas, haqiqiy ishlashini tekshiramiz
+        if _gemini_key_works():
+            logger.info("Gemini kalit ishlaydi ✅ (AI TTS + STT tayyor)")
+        else:
+            problems.append(
+                "MIYYA_API_KEY ishlamaydi (401) — AI Studio'dan yangi kalit kerak: "
+                "https://aistudio.google.com/apikey . Hozircha AI TTS/STT o'chiriladi."
+            )
+            _mark_broken("gemini")
     if not OPENAI_API_KEY:
         problems.append(
             "OPENAI_API_KEY yo'q — OpenAI TTS ishlamaydi "
@@ -1068,11 +1088,6 @@ def validate_keys() -> None:
             logger.warning("  • " + p)
     else:
         logger.info("Barcha kalitlar to'g'ri (AI TTS tayyor)")
-
-    # Noto'g'ri Gemini kaliti bo'lsa — uni o'chirib qo'yamiz (401 har bir
-    # so'rovda takrorlanmasligi uchun)
-    if GEMINI_API_KEY and not GEMINI_API_KEY.startswith("AIza"):
-        _mark_broken("gemini")
 
 
 async def synthesize_speech(
@@ -1373,13 +1388,18 @@ async def improve_prompt(text: str, mode: str = "tts") -> str:
 
 
 async def _gemini_call(contents: list, system_prompt: str | None = None,
-                       temperature: float = 0.6) -> str | None:
+                       temperature: float = 0.6,
+                       model: str | None = None) -> str | None:
     """Gemini generateContent ga so'rov yuboradi, matn javobini qaytaradi."""
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY (MIYYA_API_KEY) topilmadi")
         return None
 
-    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    if _key_broken("gemini"):
+        return None
+
+    model = model or GEMINI_MODEL
+    url = f"{GEMINI_BASE_URL}/{model}:generateContent?key={GEMINI_API_KEY}"
 
     payload = {
         "contents": contents,
@@ -1583,7 +1603,8 @@ async def llm_json(user_message: str, system_prompt: str,
     return await gemini_json(user_message, system_prompt, history, temperature)
 
 
-async def gemini_stt(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
+async def gemini_stt(audio_bytes: bytes, mime_type: str = "audio/ogg",
+                     model: str | None = None) -> str | None:
     """Ovoz faylini Gemini orqali matnga aylantiradi (STT)."""
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
     contents = [{
@@ -1600,7 +1621,7 @@ async def gemini_stt(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | 
             )},
         ]
     }]
-    return await _gemini_call(contents, temperature=0.1)
+    return await _gemini_call(contents, temperature=0.1, model=model)
 
 
 # --- STT zaxira: lokal faster-whisper (Gemini kaliti noto'g'ri bo'lsa) ---
@@ -1675,8 +1696,11 @@ async def whisper_stt(audio_bytes: bytes) -> str | None:
 
 
 async def stt_transcribe(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str | None:
-    """Ovozni matnga aylantiradi: Gemini -> Whisper -> None."""
+    """Ovozni matnga aylantiradi: Gemini (transcribe) -> Gemini (chat) -> Whisper -> None."""
     if GEMINI_API_KEY and not _key_broken("gemini"):
+        text = await gemini_stt(audio_bytes, mime_type, model=GEMINI_STT_MODEL)
+        if text:
+            return text
         text = await gemini_stt(audio_bytes, mime_type)
         if text:
             return text
