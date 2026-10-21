@@ -1,4 +1,4 @@
-# AI Ovoz Bot — ishga tushirish skripti
+# AI Ovoz Bot вЂ” ishga tushirish skripti
 # Agar bot allaqali ishlayotgan bo'lsa, yangisini ishga tushirmaydi
 # (TelegramConflictError oldini oladi).
 
