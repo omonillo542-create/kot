@@ -15,16 +15,25 @@ O'zbek tilidagi AI yordamchi Telegram bot: matnni tabiiy, ifodali sun'iy ovozga 
 | **LLM** | OpenRouter (Llama 3.3 70B) → Gemini 3.8 Flash → kalit so'z |
 | **Ovozlar** | 22 ta (8 ta AI + 12 ta Kokoro + 2 ta Fish) |
 
-> **Ishga tushirish (mahalliy, bepul):**
+> **Ishga tushirish (server):** GitHub Actions — `kot` reposidagi
+> `.github/workflows/tts-bot.yml` (har soat, `cancel-in-progress` bilan).
+> Har ikkalasi bir vaqtda ishga tushsa — `TelegramConflictError` chiqadi,
+> shuning uchun lokal va server **bir vaqtda** ishlatilmaydi.
+>
+> **Lokal tekshiruv uchun:**
 > ```powershell
 > cd "C:\Users\omonillo\Documents\Default Project\tts-bot"
-> venv731\Scripts\python.exe bot.py
+> powershell -ExecutionPolicy Bypass -File start_bot.ps1
 > ```
-> Avtomatik ishga tushish `Startup\AI_Ovoz_Bot.cmd` fayli orqali yoqilgan ✅
+> Lokal auto-start **o'chirilgan** (`Startup\AI_Ovoz_Bot.cmd.disabled`).
 
 > **Railway:** `omonillo542-create/kot` reposidan `pretty-laughter/kot` service'iga
 > deploy qilinadi. ⚠️ Free Trial'da deploylar to'xtatilgan — **Hobby plan**
-> ($5/oy) kerak yoki mahalliy ishga tushirish tavsiya etiladi.
+> ($5/oy) kerak. Hozircha GitHub Actions bepul server sifatida ishlayapti.
+
+> **Secrets:** `BOT_TOKEN`, `MIYYA_API_KEY`, `OPENROUTER_API_KEY`,
+> `OPENROUTER_THINKING_KEY`, `HF_TOKEN` — GitHub Actions secrets'ga shifrlab
+> qo'yiladi: `powershell -File tools\set_secrets.ps1 kot`
 
 ## ✨ Imkoniyatlar
 
