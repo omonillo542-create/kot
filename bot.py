@@ -105,7 +105,21 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_THINKING_KEY = os.getenv("OPENROUTER_THINKING_KEY")
-GEMINI_API_KEY = os.getenv("MIYYA_API_KEY")  # Gemini (Google AI Studio)
+# --- Gemini API kalitlar ---
+# MIYYA_API_KEY — asosiy kalit (LLM/STT uchun ham ishlatiladi).
+# Agar vergul bilan bir nechta kalit berilsa — birinchisi asosiy,
+# hammasi TTS uchun navbat bilan ishlatiladi (bittasi ishlamasa — keyingisi).
+_keys_env = [
+    k.strip() for k in (os.getenv("MIYYA_API_KEY") or "").replace(";", ",").split(",")
+    if k.strip()
+]
+GEMINI_API_KEY = _keys_env[0] if _keys_env else None  # asosiy kalit (LLM/STT)
+
+# TTS uchun navbatdagi kalitlar (asosiy + zaxiralar).
+# Barcha kalitlar MIYYA_API_KEY'da vergul bilan beriladi:
+#   MIYYA_API_KEY=kalit1,kalit2,kalit3,kalit4
+# (GitHub Actions'da bu secret sifatida saqlanadi — kodga yozilmaydi)
+GEMINI_TTS_KEYS: list[str] = list(_keys_env)
 
 # --- Fish Audio TTS (OpenRouter) — fallback sifatida saqlanadi ---
 TTS_API_URL = "https://openrouter.ai/api/v1/audio/speech"
@@ -934,18 +948,9 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = 24000, channels: int = 1) -> bytes
     return header + pcm
 
 
-async def gemini_tts(text: str, voice: str = "Kore", lang: str = "uz") -> bytes | None:
-    """Gemini 2.5 Flash TTS — juda realistik ovoz, bepul tier.
-
-    Kalit `MIYYA_API_KEY` da. Agar kalit noto'g'ri bo'lsa — 15 daqiqa
-    qayta urunilmaydi (serverga zarar bermaslik uchun).
-    """
-    if not GEMINI_API_KEY or not GEMINI_TTS_ENABLED:
-        return None
-    if _key_broken("gemini"):
-        return None
-
-    url = f"{GEMINI_BASE_URL}/{GEMINI_TTS_MODEL}:generateContent?key={GEMINI_API_KEY}"
+async def _gemini_tts_one_key(text: str, voice: str, key: str) -> bytes | None:
+    """Bitta kalit bilan Gemini TTS chaqiruvi (ichki yordamchi)."""
+    url = f"{GEMINI_BASE_URL}/{GEMINI_TTS_MODEL}:generateContent?key={key}"
     payload = {
         "contents": [{"parts": [{"text": text}]}],
         "generationConfig": {
@@ -957,48 +962,73 @@ async def gemini_tts(text: str, voice: str = "Kore", lang: str = "uz") -> bytes 
             },
         },
     }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload,
-                timeout=aiohttp.ClientTimeout(total=180),
-            ) as resp:
-                if resp.status != 200:
-                    body = (await resp.text())[:250]
-                    logger.error(f"Gemini TTS xatosi {resp.status}: {body}")
-                    if resp.status == 429:
-                        # Kvota tugdi — qisqa muddatga kutamiz (kalit buzuq emas)
-                        _mark_broken("gemini", ttl=60)
-                    elif resp.status in (400, 401, 403):
-                        _mark_broken("gemini")
-                    return None
-
-                data = await resp.json()
-                for cand in data.get("candidates", []):
-                    for part in cand.get("content", {}).get("parts", []):
-                        inline = part.get("inlineData") or {}
-                        raw = inline.get("data")
-                        if not raw:
-                            continue
-                        audio = base64.b64decode(raw)
-                        mime = (inline.get("mimeType") or "").lower()
-                        if "wav" in mime:
-                            return audio
-                        if "pcm" in mime or "l16" in mime:
-                            rate = 24000
-                            if "rate=" in mime:
-                                try:
-                                    rate = int(mime.split("rate=")[1].split(";")[0])
-                                except ValueError:
-                                    rate = 24000
-                            return pcm_to_wav(audio, sample_rate=rate)
-                        return audio
-                logger.warning("Gemini TTS: audio qaytmadi")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url, json=payload,
+            timeout=aiohttp.ClientTimeout(total=180),
+        ) as resp:
+            if resp.status != 200:
+                body = (await resp.text())[:200]
+                logger.error(f"Gemini TTS xatosi {resp.status} (kalit {key[:14]}...): {body}")
                 return None
-    except Exception as e:
-        logger.error(f"Gemini TTS xatosi: {type(e).__name__}: {str(e)[:200]}")
+
+            data = await resp.json()
+            for cand in data.get("candidates", []):
+                for part in cand.get("content", {}).get("parts", []):
+                    inline = part.get("inlineData") or {}
+                    raw = inline.get("data")
+                    if not raw:
+                        continue
+                    audio = base64.b64decode(raw)
+                    mime = (inline.get("mimeType") or "").lower()
+                    if "wav" in mime:
+                        return audio
+                    if "pcm" in mime or "l16" in mime:
+                        rate = 24000
+                        if "rate=" in mime:
+                            try:
+                                rate = int(mime.split("rate=")[1].split(";")[0])
+                            except ValueError:
+                                rate = 24000
+                        return pcm_to_wav(audio, sample_rate=rate)
+                    return audio
+    logger.warning("Gemini TTS: audio qaytmadi")
+    return None
+
+
+async def gemini_tts(text: str, voice: str = "Kore", lang: str = "uz") -> bytes | None:
+    """Gemini Flash TTS — faqat Gemini (boshqa hech qanday zaxira yo'q).
+
+    4 ta API kalit bilan ishlaydi: birinchisi ishlamasa (429 kvota / 500 /
+    tarmoq xatosi) — keyingisiga o'tadi. Barchasi ishlamasa — None.
+    """
+    if not GEMINI_TTS_KEYS or not GEMINI_TTS_ENABLED:
         return None
+
+    for i, key in enumerate(GEMINI_TTS_KEYS, 1):
+        # Bu kalit qisqa muddat "buzilgan" deb belgilangan bo'lsa — o'tkazamiz
+        if _key_broken(f"gemini{i}"):
+            continue
+        try:
+            audio = await _gemini_tts_one_key(text, voice, key)
+        except Exception as e:
+            logger.error(
+                f"Gemini TTS xatosi (kalit {i}/{len(GEMINI_TTS_KEYS)}): "
+                f"{type(e).__name__}: {str(e)[:150]}"
+            )
+            audio = None
+
+        if audio:
+            if i > 1:
+                logger.info(f"Gemini TTS: kalit {i} ishladi (kalitlar {i-1} ishlamadi)")
+            return audio
+
+        # Muvaffaqiyatsiz — bu kalitni qisqa muddatga "buzilgan" qilamiz,
+        # keyingi chaqiruvda yo'qotilgan vaqtsiz keyingi kalitga o'tamiz
+        _mark_broken(f"gemini{i}", ttl=60)
+
+    logger.error("Gemini TTS: barcha 4 kalit ishlamadi — ovoz yaratib bo'lmadi")
+    return None
 
 
 async def openai_tts(text: str, voice: str = "alloy", lang: str = "uz") -> bytes | None:
@@ -1183,6 +1213,17 @@ async def send_as_audio(
             logger.error(f"Voice yuborish xatosi ham: {e2}")
 
 
+def _default_gemini_voice(gender: str = "male") -> str:
+    """Aniq ovoz tanlanmasa — gender'ga qarab Gemini ovozini tanlaydi."""
+    defaults = {
+        "female": "Kore",
+        "male": "Charon",
+        "child": "Puck",
+        "grandpa": "Rasalgethi",
+    }
+    return defaults.get(gender, "Kore")
+
+
 async def synthesize_speech(
     text: str,
     lang: str = "uz",
@@ -1192,20 +1233,32 @@ async def synthesize_speech(
     engine: str | None = None,
 ) -> tuple[bytes | None, str]:
     """
-    Matnni ovozga aylantiradi.
-    - Edge TTS birinchi (asosiy dvigatel — bepul, tez, o'zbekcha)
-    - Kokoro TTS ikkinchi (Edge ishlamayotganda)
-    - Fish Audio uchinchi
-    - gTTS oxirgi (faqat qo'llab-quvvatlanadigan tillar)
+    Matnni ovozga aylantiradi — FAQAT Gemini TTS (4 ta API kalit bilan).
 
-    `engine` — katalogdan aniq dvigatel tanlangan bo'lsa ("kokoro"/"fish"),
-    o'sha dvigatel birinchi ishlatiladi.
+    Kalitlar navbat bilan sinab ko'riladi: birinchisi ishlamasa
+    (429 kvota / 500 / tarmoq xatosi) — keyingisi ishlaydi.
+    Barchasi ishlamasa — None qaytadi (boshqa hech qanday zaxira yo'q).
+
+    `voice_id` — katalogdan tanlangan Gemini ovozi ("Kore", "Puck", ...).
+    `gender` — aniq ovoz tanlanmasa, gender'ga qarab standart ovoz tanlanadi.
+    `engine` — eskirgan parametr; endi faqat "gemini" ishlatiladi.
 
     Qaytadi: (audio_bytes | None, qaysi dvigatel ishlatildi)
     """
     text = (text or "").strip()
     if not text:
         return None, ""
+
+    # Aniq ovoz tanlanmasa — gender'ga qarab Gemini ovozini tanlaymiz
+    if not voice_id:
+        voice_id = _default_gemini_voice(gender)
+
+    audio = await gemini_tts(text, voice_id, lang)
+    if audio:
+        return audio, "Gemini TTS"
+
+    logger.error(f"Ovoz yaratib bo'lmadi (lang={lang}, voice={voice_id})")
+    return None, ""
 
     fish_speed = FISH_SPEEDS.get(speed, 1.0)
 
@@ -2541,55 +2594,71 @@ def set_mode(uid: int, mode: str) -> None:
     _user_mode[uid] = mode
 
 
-# --- Ovoz katalogi ---
-# engine: gemini | openai | kokoro | fish
+# --- Ovoz katalogi (faqat Gemini TTS — 4 ta API kalit bilan) ---
+# engine: gemini (boshqa hech qanday dvigatel yo'q)
 VOICE_CATALOG: list[dict] = [
-    {"name": "💫 Kore · AI", "engine": "gemini", "id": "Kore",
-     "gender": "female", "desc": "Gemini TTS — eng tabiiy, ifodali"},
-    {"name": "🔊 Puck · AI", "engine": "gemini", "id": "Puck",
-     "gender": "male", "desc": "Gemini TTS — yosh, quvnoq"},
-    {"name": "🎭 Fenrir · AI", "engine": "gemini", "id": "Fenrir",
-     "gender": "male", "desc": "Gemini TTS — chuqur, kuchli"},
-    {"name": "🌸 Aoede · AI", "engine": "gemini", "id": "Aoede",
-     "gender": "female", "desc": "Gemini TTS — yumshoq, iliq"},
-    {"name": "🧔 Alloy · AI", "engine": "openai", "id": "alloy",
-     "gender": "male", "desc": "OpenAI TTS — aniq, zamonaviy"},
-    {"name": "🌊 Nova · AI", "engine": "openai", "id": "nova",
-     "gender": "female", "desc": "OpenAI TTS — energiya bilan to'ldirilgan"},
-    {"name": "✨ Shimmer · AI", "engine": "openai", "id": "shimmer",
-     "gender": "female", "desc": "OpenAI TTS — yumshoq, tabiiy"},
-    {"name": "🗿 Onyx · AI", "engine": "openai", "id": "onyx",
-     "gender": "male", "desc": "OpenAI TTS — qattiq, ishonchli"},
-    {"name": "🧔 Erkak · Rasmiy", "engine": "kokoro", "id": "am_michael",
-     "gender": "male", "desc": "Aniq, rasmiy, ishonchli"},
-    {"name": "👨 Erkak · Tabiiy", "engine": "kokoro", "id": "am_liam",
-     "gender": "male", "desc": "Yumshoq, tabiiy, samimiy"},
-    {"name": "🧑 Erkak · Chuqur", "engine": "kokoro", "id": "am_adam",
-     "gender": "male", "desc": "Chuqur, ziddiyatli"},
-    {"name": "🧔 Erkak · Do'stona", "engine": "kokoro", "id": "am_eric",
-     "gender": "male", "desc": "Do'stona, iliq"},
-    {"name": "👩 Ayol · Tabiiy", "engine": "kokoro", "id": "af_heart",
-     "gender": "female", "desc": "Tabiiy, iliq, tinch"},
-    {"name": "👩‍🦰 Ayol · Ekspressiv", "engine": "kokoro", "id": "af_bella",
+    # === Ayol ovozlari ===
+    {"name": "🎙 Kore — Ayol (Tabiiy)", "engine": "gemini", "id": "Kore",
+     "gender": "female", "desc": "Eng tabiiy, ifodali ayol ovozi"},
+    {"name": "🎙 Aoede — Ayol (Iliq)", "engine": "gemini", "id": "Aoede",
+     "gender": "female", "desc": "Yumshoq, iliq, tinch"},
+    {"name": "🎙 Leda — Ayol (Yosh)", "engine": "gemini", "id": "Leda",
+     "gender": "female", "desc": "Yosh, quvnoq, energiyali"},
+    {"name": "🎙 Callirrhoe — Ayol (Samimiy)", "engine": "gemini", "id": "Callirrhoe",
+     "gender": "female", "desc": "Samimiy, suhbatdosh"},
+    {"name": "🎙 Autonoe — Ayol (Ekspresiv)", "engine": "gemini", "id": "Autonoe",
      "gender": "female", "desc": "Jonli, ekspressiv"},
-    {"name": "🧘 Ayol · Sokin", "engine": "kokoro", "id": "af_nicole",
+    {"name": "🎙 Despina — Ayol (Sokin)", "engine": "gemini", "id": "Despina",
      "gender": "female", "desc": "Sokin, meditativ"},
-    {"name": "👩 Ayol · Suhbatdosh", "engine": "kokoro", "id": "af_sarah",
-     "gender": "female", "desc": "Yangi, suhbatdosh"},
-    {"name": "🧒 Bola · Yosh", "engine": "kokoro", "id": "am_puck",
+    {"name": "🎙 Erinome — Ayol (Aniq)", "engine": "gemini", "id": "Erinome",
+     "gender": "female", "desc": "Aniq, rasmiy, ishonchli"},
+    {"name": "🎙 Sadachbia — Ayol (Quvnoq)", "engine": "gemini", "id": "Sadachbia",
+     "gender": "female", "desc": "Quvnoq, samimiy"},
+    {"name": "🎙 Sulafat — Ayol (Musiqiy)", "engine": "gemini", "id": "Sulafat",
+     "gender": "female", "desc": "Musiqiy, ifodali"},
+    {"name": "🎙 Pulcherrima — Ayol (Ajoyib)", "engine": "gemini", "id": "Pulcherrima",
+     "gender": "female", "desc": "Ajoyib, jozibali"},
+    # === Erkak ovozlari ===
+    {"name": "🎙 Charon — Erkak (Dramatik)", "engine": "gemini", "id": "Charon",
+     "gender": "male", "desc": "Chuqur, dramatik, kuchli"},
+    {"name": "🎙 Fenrir — Erkak (Kuchli)", "engine": "gemini", "id": "Fenrir",
+     "gender": "male", "desc": "Chuqur, kuchli, ishonchli"},
+    {"name": "🎙 Orus — Erkak (Rasmiy)", "engine": "gemini", "id": "Orus",
+     "gender": "male", "desc": "Rasmiy, aniq, ishonchli"},
+    {"name": "🎙 Enceladus — Erkak (Chuqur)", "engine": "gemini", "id": "Enceladus",
+     "gender": "male", "desc": "Chuqur, sokin, donishmand"},
+    {"name": "🎙 Iapetus — Erkak (Sokin)", "engine": "gemini", "id": "Iapetus",
+     "gender": "male", "desc": "Sokin, muvozanatli"},
+    {"name": "🎙 Umbriel — Erkak (Dono)", "engine": "gemini", "id": "Umbriel",
+     "gender": "male", "desc": "Dono, hikoyachi"},
+    {"name": "🎙 Algieba — Erkak (Musiqiy)", "engine": "gemini", "id": "Algieba",
+     "gender": "male", "desc": "Musiqiy, ifodali"},
+    {"name": "🎙 Sadaltager — Erkak (Hikoyachi)", "engine": "gemini", "id": "Sadaltager",
+     "gender": "male", "desc": "Hikoyachi, ko'ngilli"},
+    {"name": "🎙 Schedar — Erkak (Do'stona)", "engine": "gemini", "id": "Schedar",
+     "gender": "male", "desc": "Do'stona, iliq"},
+    {"name": "🎙 Alnilam — Erkak (Aniq)", "engine": "gemini", "id": "Alnilam",
+     "gender": "male", "desc": "Aniq, zamonaviy"},
+    {"name": "🎙 Zubenelgenubi — Erkak (Sokin)", "engine": "gemini", "id": "Zubenelgenubi",
+     "gender": "male", "desc": "Sokin, muvozanatli"},
+    {"name": "🎙 Algenib — Erkak (Qattiq)", "engine": "gemini", "id": "Algenib",
+     "gender": "male", "desc": "Qattiq, ishonchli"},
+    {"name": "🎙 Achernar — Erkak (Energiyali)", "engine": "gemini", "id": "Achernar",
+     "gender": "male", "desc": "Energiyali, jonli"},
+    {"name": "🎙 Achird — Erkak (Tabiiy)", "engine": "gemini", "id": "Achird",
+     "gender": "male", "desc": "Tabiiy, samimiy"},
+    # === Bibovalar / keksalar ===
+    {"name": "🎙 Rasalgethi — Bobo (Keksa)", "engine": "gemini", "id": "Rasalgethi",
+     "gender": "grandpa", "desc": "Keksa, dono, hikoyachi"},
+    {"name": "🎙 Gacrux — Bibi (Keksa)", "engine": "gemini", "id": "Gacrux",
+     "gender": "grandpa", "desc": "Keksa ayol, hikoyachi, iliq"},
+    {"name": "🎙 Vindemiatrix — Bibi (Dono)", "engine": "gemini", "id": "Vindemiatrix",
+     "gender": "grandpa", "desc": "Keksa, dono, iliq"},
+    # === Bola ovozlari ===
+    {"name": "🎙 Puck — Bola (Yosh)", "engine": "gemini", "id": "Puck",
      "gender": "child", "desc": "Yosh, quvnoq, serb"},
-    {"name": "👶 Bola · Ilhom", "engine": "kokoro", "id": "af_nova",
+    {"name": "🎙 Laomedeia — Bola (Ilhom)", "engine": "gemini", "id": "Laomedeia",
      "gender": "child", "desc": "Yumshoq, ilhomlantiruvchi"},
-    {"name": "👴 Keksa · Chuqur", "engine": "kokoro", "id": "am_echo",
-     "gender": "grandpa", "desc": "Chuqur, keksa, donish"},
-    {"name": "👴 Keksa · Hikoyachi", "engine": "kokoro", "id": "bm_george",
-     "gender": "grandpa", "desc": "Hikoyachi, ko'ngilli"},
-    {"name": "🇺🇿 O'zbek · Erkak", "engine": "fish",
-     "id": "44ad146afad04e4e99a7b98b8f97106f", "gender": "male",
-     "desc": "Fish Audio — kirill moslash, to'g'ri o'zbek talaffuzi"},
-    {"name": "🇺🇿 O'zbek · Ayol", "engine": "fish",
-     "id": "933563129e564b19a115bedd57b7406a", "gender": "female",
-     "desc": "Fish Audio — kirill moslash, to'g'ri o'zbek talaffuzi"},
 ]
 
 VOICE_SAMPLE = "Salom! Men sizning ovoz yordamchingizman. Bugun nima qilamiz?"
