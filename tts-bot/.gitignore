@@ -1,0 +1,36 @@
+# Maxfiy fayllar
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Vaqtinchalik fayllar
+tmp/
+*.wav
+*.mp3
+*.ogg
+bot_local.log
+bot_local.log.err
+bot_startup.log
+bot_startup.log.err
+
+# Baza (foydalanuvchi ma'lumotlari — commit qilinmaydi)
+bot.db
+
+# Test fayllari va artefaktlar
+test_*.py
+!test_uzbek_phonetics.py
+test_fayl.*
+changelog.txt
+
+# Virtual muhit
+venv*/
+.venv/
+
+# IDE
+.vscode/
+.idea/
